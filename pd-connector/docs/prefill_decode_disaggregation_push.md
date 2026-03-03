@@ -19,10 +19,12 @@ sequenceDiagram
 
     Prefiller_OC->>Prefiller_PD: save(blocks, D identity)
     Note right of Prefiller_PD: If no connection to D exists,<br/>do handshake and create connection
-    Prefiller_PD->>Decoder_PD: AllocateFetch(blocks_hash, local_block_desc)
-    Decoder_PD->>Decoder_CPU_Cache: PrepareLoad(block_hashs)
-    Decoder_PD->>Prefiller_PD: NIXL.Transfer(READ, local_block_descs, remote_block_descs)
-    Decoder_CPU_Cache-->>Decoder_PD: done
-    Prefiller_PD-->>Prefiller_OC: done
+    Prefiller_PD->>Decoder_PD: 𝗖𝗧𝗥𝗟:allocate_fetch(blocks_hash, local_block_desc)
+    Decoder_PD->>Decoder_CPU_Cache: prepare_load(block_hashs)
+    Decoder_PD-)Prefiller_PD: 𝗗𝗔𝗧𝗔:NIXL.Transfer(READ, local_block_descs, remote_block_descs)
+    Decoder_PD-->>Prefiller_PD: Transfer complete
+    Decoder_PD-->>Decoder_PD: Transfer complete
+    Prefiller_PD->>Prefiller_OC: save_completed
+    Decoder_PD->>Decoder_CPU_Cache: complete_load(block_hashs)
     Decoder_OC->>Decoder_CPU_Cache: load(block_hashs)
 ```
