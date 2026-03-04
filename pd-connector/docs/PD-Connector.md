@@ -28,7 +28,7 @@ In this design PD disaggregation is based on the vLLM CPU KV cache which is per 
 
 #### Components
 
-- **PrimaryPillar** — The main vLLM inference engine component that drives the KV cache lifecycle. It interacts with the OffloadingManager to coordinate when blocks should be stored or loaded, and triggers secondary pillars accordingly.
+- **PrimaryPillar** — The main component that drives the KV cache lifecycle. It interacts with the OffloadingManager to offload GPU memory to CPU and triggers secondary pillars accordingly.
 
 - **OffloadingManager** — Runs in the scheduler and tracks which KV blocks are offloaded and their address. Exposes the following primitives to secondary pillars:
   - `lookup()` — find the length of the maximal series of blocks, starting from the first one, that are all offloaded.
