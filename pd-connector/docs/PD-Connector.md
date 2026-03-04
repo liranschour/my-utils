@@ -30,13 +30,7 @@ In this design PD disaggregation is based on the vLLM CPU KV cache which is per 
 
 - **PrimaryPillar** — The main component that drives the KV cache lifecycle. It interacts with the OffloadingManager to offload GPU memory to CPU and triggers secondary pillars accordingly.
 
-- **OffloadingManager** — Runs in the scheduler and tracks which KV blocks are offloaded and their address. Exposes the following primitives to secondary pillars:
-  - `lookup()` — find the length of the maximal series of blocks, starting from the first one, that are all offloaded.
-  - `prepare_load()` — prepare given blocks to be read, protecting them from eviction. Returns a `LoadStoreSpec` for the worker.
-  - `touch()` — mark blocks as recently used for LRU tracking.
-  - `complete_load()` — mark previously prepared blocks as done loading, re-allowing eviction.
-  - `prepare_store()` — prepare given blocks to be written. Returns a `PrepareStoreOutput` with store spec and evicted blocks.
-  - `complete_store()` — mark a previous store as completed, making blocks loadable.
+- **OffloadingManager** — Runs in the scheduler and tracks which KV blocks are offloaded and their address. Exposes primitives to secondary pillars for load and store operations.
 
 - **SecondaryPillar** — A pluggable component registered with the OffloadingManager that implements the actual KV cache transfer between nodes. The PD Connector is implemented as a secondary pillar, handling load and store between peers.
 
@@ -60,7 +54,15 @@ graph TD
     - How do we index these blocks
 
 ### API
-#### Secondary pillar
+#### OffloadingManager
+- `lookup()` — find the length of the maximal series of blocks, starting from the first one, that are all offloaded.
+- `prepare_load()` — prepare given blocks to be read, protecting them from eviction. Returns a `LoadStoreSpec` for the worker.
+- `touch()` — mark blocks as recently used for LRU tracking.
+- `complete_load()` — mark previously prepared blocks as done loading, re-allowing eviction.
+- `prepare_store()` — prepare given blocks to be written. Returns a `PrepareStoreOutput` with store spec and evicted blocks.
+- `complete_store()` — mark a previous store as completed, making blocks loadable.
+
+#### Secondary Pillar
 - `register_secondary_pilar()`
 - `load(job_id, block_hashs, peer_id)` — Decoder initiates a load from Prefiller
 - `save(job_id, block_descs)` — Prefiller saves blocks
