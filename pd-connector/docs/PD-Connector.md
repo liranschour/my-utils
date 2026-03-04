@@ -50,8 +50,7 @@ graph TD
 - P block IDs – how do we pass request's allocated blocks on Prefiller to Decoder
   - **Option 1** - Add allocated blocks to request header on Prefiller
     - When do we know for sure that blocks have been saved already
-  - **Option 2** - Control message from D to Prefiller to lookup and pin the blocks (also transfer is possible here): `LookupAndTransfer(blocks_hash, len, Decoder_allocated_blocks_ids)`
-    - How do we index these blocks
+  - **Option 2** - Control message that will prepare the data operation and then trigger one-sided transfer
 
 ### API
 #### OffloadingManager
