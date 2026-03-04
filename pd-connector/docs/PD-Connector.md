@@ -8,7 +8,7 @@ In this design PD disaggregation is based on the vLLM CPU KV cache which is per 
 
 - Decoder can be known or unknown to Prefiller when a request is submitted to the Prefiller (Deffered decode)
 - A request can be submitted to the Decoder before Prefiller has completed the request
-- Translating canonical layout to per GPU worker layout is done in the worker connector context (Secondary pillars are agnostic to that)
+- Translating canonical layout to per GPU worker layout is done in the worker context (Secondary pillars are agnostic to that)
 - A store operation to the CPU KV cache can fail only by:
   - Allocation failure
   - Prefiller crash
