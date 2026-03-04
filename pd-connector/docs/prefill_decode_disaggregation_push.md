@@ -9,11 +9,8 @@ sequenceDiagram
     participant Decoder_CPU_Cache as Decoder CPU Cache
     participant Decoder_OC as Decoder OC
 
-    par
-        Prefiller_PD->>Prefiller_PD: Open listener thread
-    and
-        Decoder_PD->>Decoder_PD: Open listener thread
-    end
+    Prefiller_PD->>Prefiller_PD: Open listener thread
+    Decoder_PD->>Decoder_PD: Open listener thread
 
     Note over Prefiller_OC,Decoder_OC: ── Init time ──
 
