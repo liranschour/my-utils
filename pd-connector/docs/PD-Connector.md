@@ -44,9 +44,10 @@ In this design PD disaggregation is based on the vLLM CPU KV cache which is per 
 
 ```mermaid
 graph TD
-    PP[PrimaryPillar] -->|schedule load/store| OM[OffloadingManager\nCPU KV Cache]
-    OM -->|load / store / abort| SP[SecondaryPillar\nPD Connector]
-    SP -->|prepare_load /prepare_store| OM
+    PP[PrimaryPillar] -->|schedule load/store| OM["OffloadingManager<br/>CPU KV Cache"]
+    PP -->|load/store/abort| SP["SecondaryPillar<br/>PD Connector"]
+    SP -->|prepare load| OM
+    SP -->|prepare store| OM
     SP -->|NIXL.Transfer| Remote[Remote Peer PD]
 ```
 
