@@ -2,7 +2,7 @@
 
 ## Abstract
 
-In this design PD disaggregation is based on the vLLM CPU KV cache which is per vLLM instance and it is in canonical layout (single TP unified block size). The PD Connector is a secondary pillar that is registered as such. The OffloadingManager, which controls the CPU KV cache, exposes an API to the secondary pillar to allow load, store and abort operations.
+In this design PD disaggregation is based on the vLLM CPU KV cache which is per vLLM instance and it is in canonical layout (single TP unified block size). The PD Connector is a secondary pillar that is registered as such. Orchestration with the CPU cache is done via the PrimaryPillar and it not known to the secondar pillars.
 
 ## Assumptions
 
@@ -30,8 +30,6 @@ In this design PD disaggregation is based on the vLLM CPU KV cache which is per 
 
 - **PrimaryPillar** — The main component that drives the KV cache lifecycle. It interacts with the OffloadingManager to offload GPU memory to CPU and triggers secondary pillars accordingly.
 
-- **OffloadingManager** — Runs in the scheduler and tracks which KV blocks are offloaded and their address. Exposes primitives to secondary pillars for load and store operations.
-
 - **SecondaryPillar** — A pluggable component registered with the OffloadingManager that implements the actual KV cache transfer between nodes. The PD Connector is implemented as a secondary pillar, handling load and store between peers.
 
 #### Component Diagram
@@ -39,9 +37,9 @@ In this design PD disaggregation is based on the vLLM CPU KV cache which is per 
 ```mermaid
 graph TD
     PP[PrimaryPillar] -->|schedule load/store| OM["OffloadingManager<br/>CPU KV Cache"]
-    PP -->|load/store/abort| SP["SecondaryPillar<br/>PD Connector"]
+    PP -->|load/save| SP["SecondaryPillar<br/>PD Connector"]
     SP -->|prepare load| OM
-    SP -->|prepare store| OM
+    SP -->|prepare save| OM
     SP -->|CTRL:lookup_fetch| Remote[Remote Peer PD]
     SP -->|NIXL.Transfer| Remote
 ```
@@ -54,20 +52,13 @@ graph TD
   - **Option 2** - Control message that will prepare the data operation and then trigger one-sided transfer.
 - Allow streaming of saved KV blocks on the prefiller side to the Decoder.
 ### API
-#### OffloadingManager
-- `lookup()` — find the length of the maximal series of blocks, starting from the first one, that are all offloaded.
-- `prepare_load()` — prepare given blocks to be read, protecting them from eviction. Returns a `LoadStoreSpec` for the worker.
-- `touch()` — mark blocks as recently used for LRU tracking.
-- `complete_load()` — mark previously prepared blocks as done loading, re-allowing eviction.
-- `prepare_store()` — prepare given blocks to be written. Returns a `PrepareStoreOutput` with store spec and evicted blocks.
-- `complete_store()` — mark a previous store as completed, making blocks loadable.
 
 #### Secondary Pillar
 - `register_secondary_pilar()`
 - `load(job_id, block_hashs, peer_id)` — Decoder initiates a load from Prefiller
+- `get_required_blocks()` - Polled by the primary pillar
 - `save(job_id, block_descs)` — Prefiller saves blocks
 - `get_finished()` — Async notification of load/save operation completion
-- `abort(job_id)` — Abort an in-progress operation
 
 ### Flow
 
@@ -94,7 +85,7 @@ sequenceDiagram
     Decoder_OC->>Decoder_PD: load(job_id, block_hashs, peer_id)
     Note right of Prefiller_PD: If no connection to D exists,<br/>do handshake and create connection
 
-    Decoder_PD->>Decoder_CPU_Cache: prepare_store(block_hashs)
+    Decoder_PD->>Decoder_CPU_Cache: prepare_save(block_hashs)
 
     Decoder_PD->>Prefiller_PD: 𝗖𝗧𝗥𝗟:lookup_fetch(job_id, block_hashs, local_block_descs)
 
@@ -105,7 +96,7 @@ sequenceDiagram
     Prefiller_PD-->>Decoder_PD: Transfer complete
     Prefiller_PD-->>Prefiller_PD: Transfer complete
     Prefiller_PD->>Prefiller_CPU_Cache: complete_load(block_hashs)
-    Decoder_PD->>Decoder_CPU_Cache: complete_store(block_hashs)
+    Decoder_PD->>Decoder_CPU_Cache: complete_save(block_hashs)
 
 
     Decoder_OC->>Decoder_PD: get_finished(job_id)
@@ -114,16 +105,11 @@ sequenceDiagram
 ```
 ### Error Handling
 #### Allocation Failure on Prefiller Side (valid only when a request is sent to the Decoder before the Prefiller completes it)
-Two options are available:
-- **Option 1** — The orchestration layer sends an abort to the Decoder.
-- **Option 2** — On the Prefiller side, the secondary pillar is notified about the request abort and fails the `lookup_fetch` call accordingly.
+TBD
 #### vLLM Crash
 - A lost control connection between the Prefiller and the Decoder should trigger an abort of all ongoing requests.
 #### Submit lookup_fetch() before a request is submitted to the Prefiller
-- OffloadingManager.prepare_load() should return the following status:
-  1. SUCCESS - When KV blocks exist (KV block descs will be returned)
-  2. NOT_EXIST - There is no ongoing save operation for these blocks
-  3. PENDING - There is uncompleted save operation for these blocks
+- Timeout TBD
 
 ## Implementation
 
@@ -136,9 +122,9 @@ PrimaryPillar --> SecondaryPillars --> [SecondaryPillar, SecondaryPillar, ...]
 ```
 
 #### Tasks
-- [ ] Define `SecondaryPillar` abstract base class with `load`, `save`, `get_finished`, `abort` methods
+- [ ] Define `SecondaryPillar` abstract base class with `load`, `save`, `get_finished` methods
 - [ ] Implement `SecondaryPillars` registry with `register(pillar: SecondaryPillar)` and dispatch methods
-- [ ] `PrimaryPillar` holds a reference to `SecondaryPillars` and calls it on `load`/`save`/`abort`
+- [ ] `PrimaryPillar` holds a reference to `SecondaryPillars` and calls it on `load`/`save`
 - [ ] `SecondaryPillars` iterates registered pillars and calls each in sequence
 - [ ] Add unit tests for registration and sequential dispatch
 
@@ -157,14 +143,13 @@ python3 -m pytest tests/test_secondary_pillars.py -v
 Implement `PDConnector` as a concrete `SecondaryPillar`. It handles the actual KV cache transfer between Prefiller and Decoder nodes using NIXL.
 
 On the **Prefiller side**, `save()` stores KV block descriptors and waits for incoming `lookup_fetch` requests from the Decoder.
-On the **Decoder side**, `load()` connects to the Prefiller peer, sends a `lookup_fetch` control message, and triggers a NIXL transfer to pull the blocks into the local CPU cache.
+On the **Decoder side**, `load()` connects to the Prefiller peer, sends a `lookup_fetch` control message, and triggers a NIXL transfer to save the blocks into the local CPU cache.
 
 #### Tasks
 - [ ] Implement `PDConnector(SecondaryPillar)` class in `src/pd_connector.py`
 - [ ] `save(job_id, block_descs)` — register block descriptors, ready to serve `lookup_fetch`
 - [ ] `load(job_id, block_hashes, peer_id)` — connect to peer, send `CTRL:lookup_fetch`, trigger NIXL transfer
 - [ ] `get_finished(job_ids)` — poll NIXL transfer status and return completed job ids
-- [ ] `abort(job_id)` — cancel pending transfer and release allocated blocks
 - [ ] Add unit tests in `tests/test_pd_connector.py`
 
 #### Tests
@@ -203,7 +188,7 @@ Peer C (DEALER) ──┘         │
 - [ ] Sender: ZMQ `DEALER` socket per peer (lazily created), sends messages to a specific peer
 - [ ] Heartbeat sender: background thread sends heartbeat to each connected peer at `heartbeat_interval_s`
 - [ ] Heartbeat monitor: background thread checks `last_seen` and calls `on_peer_down(peer_id)` on timeout
-- [ ] Register `on_peer_down` callback in `PDConnector` to abort all jobs for the failed peer
+- [ ] Register `on_peer_down` callback in `PDConnector` to cancel in-progress jobs for the failed peer
 - [ ] Add unit tests in `tests/test_zmq_ctrl_transport.py`
 
 #### Tests
@@ -215,3 +200,38 @@ To run:
 cd /home/lirans/my-utils/pd-connector
 python3 -m pytest tests/test_zmq_ctrl_transport.py -v
 ```
+
+### Step 4: NIXL Transfer
+
+Replace the `NixlTransport` abstraction with a direct `nixl_agent` implementation inside `PDConnector`. No wrapper class — NIXL calls are made inline.
+
+#### NIXL API mapping
+
+| PDConnector action | NIXL call |
+|---|---|
+| Startup | `nixl_agent(peer_id, nixl_agent_config())` |
+| `save()` | `agent.register_memory(block_descs, mem_type="DRAM")` |
+| `connect()` | exchange `agent_metadata` over ZMQ ctrl channel → `agent.add_remote_agent(remote_metadata)` |
+| `_handle_lookup_fetch()` | `agent.get_xfer_descs(local_descs)` + `agent.initialize_xfer("WRITE", ...)` + `agent.transfer(handle)` |
+| `get_finished()` | `agent.check_xfer_state(handle)` == `"DONE"` for each active handle |
+| `save()` complete | `agent.deregister_memory(reg_list)` |
+
+#### Metadata exchange
+
+NIXL requires both peers to have each other's agent metadata before a transfer can start. The metadata is exchanged over the existing ZMQ ctrl channel using a new message type:
+
+```
+Decoder → Prefiller:  {"type": "agent_metadata", "peer_id": "...", "metadata": <bytes>}
+Prefiller → Decoder:  {"type": "agent_metadata", "peer_id": "...", "metadata": <bytes>}
+```
+
+`PDConnector.connect()` sends local metadata immediately after the ZMQ connection is established. The listener thread handles incoming `agent_metadata` messages by calling `agent.add_remote_agent()`.
+
+#### Tasks
+- [ ] Create `nixl_agent` in `PDConnector.__init__()` with UCX backend
+- [ ] In `save()`, register block memory with NIXL and store `nixlRegDList` per job
+- [ ] In `connect()`, send local `agent_metadata` over ZMQ ctrl channel
+- [ ] In `_listen()`, handle `agent_metadata` message → call `agent.add_remote_agent()`
+- [ ] In `_handle_lookup_fetch()`, call `initialize_xfer("WRITE", ...)` + `transfer()`, store handle keyed by transfer_id
+- [ ] In `get_finished()`, call `check_xfer_state()` per active handle; on `"DONE"` release handle and deregister memory
+- [ ] Add integration test with two real PDConnector instances and CPU DRAM buffers
