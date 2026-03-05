@@ -42,7 +42,8 @@ graph TD
     PP -->|load/store/abort| SP["SecondaryPillar<br/>PD Connector"]
     SP -->|prepare load| OM
     SP -->|prepare store| OM
-    SP -->|NIXL.Transfer| Remote[Remote Peer PD]
+    SP -->|CTRL:lookup_fetch| Remote[Remote Peer PD]
+    SP -->|NIXL.Transfer| Remote
 ```
 
 ### Design Decisions
