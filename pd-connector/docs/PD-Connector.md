@@ -47,11 +47,11 @@ graph TD
 
 ### Design Decisions
 
-- P block IDs – how do we pass request's allocated blocks on Prefiller to Decoder
-  - **Option 1** - Add allocated blocks to request header on Prefiller
+- P block IDs – how do we pass request's allocated blocks on Prefiller to Decoder.
+  - **Option 1** - Add allocated blocks to request header on Prefiller.
     - When do we know for sure that blocks have been saved already
-  - **Option 2** - Control message that will prepare the data operation and then trigger one-sided transfer
-
+  - **Option 2** - Control message that will prepare the data operation and then trigger one-sided transfer.
+- Allow streaming of saved KV blocks on the prefiller side to the Decoder.
 ### API
 #### OffloadingManager
 - `lookup()` — find the length of the maximal series of blocks, starting from the first one, that are all offloaded.
@@ -88,6 +88,8 @@ sequenceDiagram
 
     Prefiller_OC->>Prefiller_PD: save(job_id, block_descs)
 
+    Note over Prefiller_OC: Poll until get_finshed(job_id) returns completed
+
     Decoder_OC->>Decoder_PD: load(job_id, block_hashs, peer_id)
     Note right of Prefiller_PD: If no connection to D exists,<br/>do handshake and create connection
 
@@ -104,5 +106,72 @@ sequenceDiagram
     Prefiller_PD->>Prefiller_CPU_Cache: complete_load(block_hashs)
     Decoder_PD->>Decoder_CPU_Cache: complete_store(block_hashs)
 
-    Decoder_OC->>Decoder_CPU_Cache: load(block_hashs)
+
+    Decoder_OC->>Decoder_PD: get_finished(job_id)
+    Prefiller_OC->>Prefiller_PD: get_finished(job_id)
+
+```
+### Error Handling
+#### Allocation Failure on Prefiller Side (valid only when a request is sent to the Decoder before the Prefiller completes it)
+Two options are available:
+- **Option 1** — The orchestration layer sends an abort to the Decoder.
+- **Option 2** — On the Prefiller side, the secondary pillar is notified about the request abort and fails the `lookup_fetch` call accordingly.
+#### vLLM Crash
+- A lost control connection between the Prefiller and the Decoder should trigger an abort of all ongoing requests.
+#### Submit lookup_fetch() before a request is submitted to the Prefiller
+- OffloadingManager.prepare_load() should return the following status:
+  1. SUCCESS - When KV blocks exist (KV block descs will be returned)
+  2. NOT_EXIST - There is no ongoing save operation for these blocks
+  3. PENDING - There is uncompleted save operation for these blocks
+
+## Implementation
+
+### Step 1: SecondaryPillars
+
+Introduce a `SecondaryPillar` base class and a `SecondaryPillars` registry component. `PrimaryPillar` depends on `SecondaryPillars` to dispatch operations. Individual `SecondaryPillar` implementations register themselves into `SecondaryPillars` without any knowledge of `PrimaryPillar`.
+
+```
+PrimaryPillar --> SecondaryPillars --> [SecondaryPillar, SecondaryPillar, ...]
+```
+
+#### Tasks
+- [ ] Define `SecondaryPillar` abstract base class with `load`, `save`, `get_finished`, `abort` methods
+- [ ] Implement `SecondaryPillars` registry with `register(pillar: SecondaryPillar)` and dispatch methods
+- [ ] `PrimaryPillar` holds a reference to `SecondaryPillars` and calls it on `load`/`save`/`abort`
+- [ ] `SecondaryPillars` iterates registered pillars and calls each in sequence
+- [ ] Add unit tests for registration and sequential dispatch
+
+#### Tests
+
+Tests are located in `tests/test_secondary_pillars.py`.
+
+To run:
+```bash
+cd /home/lirans/my-utils/pd-connector
+python3 -m pytest tests/test_secondary_pillars.py -v
+```
+
+### Step 2: PDConnector as a SecondaryPillar
+
+Implement `PDConnector` as a concrete `SecondaryPillar`. It handles the actual KV cache transfer between Prefiller and Decoder nodes using NIXL.
+
+On the **Prefiller side**, `save()` stores KV block descriptors and waits for incoming `lookup_fetch` requests from the Decoder.
+On the **Decoder side**, `load()` connects to the Prefiller peer, sends a `lookup_fetch` control message, and triggers a NIXL transfer to pull the blocks into the local CPU cache.
+
+#### Tasks
+- [ ] Implement `PDConnector(SecondaryPillar)` class in `src/pd_connector.py`
+- [ ] `save(job_id, block_descs)` — register block descriptors, ready to serve `lookup_fetch`
+- [ ] `load(job_id, block_hashes, peer_id)` — connect to peer, send `CTRL:lookup_fetch`, trigger NIXL transfer
+- [ ] `get_finished(job_ids)` — poll NIXL transfer status and return completed job ids
+- [ ] `abort(job_id)` — cancel pending transfer and release allocated blocks
+- [ ] Add unit tests in `tests/test_pd_connector.py`
+
+#### Tests
+
+Tests are located in `tests/test_pd_connector.py`.
+
+To run:
+```bash
+cd /home/lirans/my-utils/pd-connector
+python3 -m pytest tests/test_pd_connector.py -v
 ```
