@@ -1,39 +1,10 @@
-import threading
 import time
 import pytest
 
 from src.secondary_pillar import BlockDesc
-from src.pd_connector import (
-    CtrlTransport,
-    NixlTransport,
-    PDConnector,
-)
+from src.pd_connector import NixlTransport, PDConnector
 
-
-# ---------------------------------------------------------------------------
-# Mock transports
-# ---------------------------------------------------------------------------
-
-class MockCtrl(CtrlTransport):
-    def __init__(self):
-        self._inbox: list[tuple[str, dict]] = []
-        self._sent:  list[tuple[str, dict]] = []
-        self._cond = threading.Condition()
-
-    def send(self, peer_id: str, msg: dict) -> None:
-        self._sent.append((peer_id, msg))
-
-    def deliver(self, sender_id: str, msg: dict) -> None:
-        """Inject a message as if received from a remote peer."""
-        with self._cond:
-            self._inbox.append((sender_id, msg))
-            self._cond.notify()
-
-    def recv(self) -> tuple[str, dict]:
-        with self._cond:
-            while not self._inbox:
-                self._cond.wait()
-            return self._inbox.pop(0)
+BASE_PORT = 15300
 
 
 class MockNixl(NixlTransport):
@@ -55,96 +26,99 @@ class MockNixl(NixlTransport):
         self._finished.add(transfer_id)
 
 
-# ---------------------------------------------------------------------------
-# Tests
-# ---------------------------------------------------------------------------
+def _make_pair(port_p: int, port_d: int):
+    """Create a connected Prefiller / Decoder PDConnector pair."""
+    nixl_p = MockNixl()
+    nixl_d = MockNixl()
+    prefiller = PDConnector("prefiller", port_p, nixl_p,
+                             heartbeat_ivl_ms=200, heartbeat_timeout_ms=1000)
+    decoder   = PDConnector("decoder",   port_d, nixl_d,
+                             heartbeat_ivl_ms=200, heartbeat_timeout_ms=1000)
+    prefiller.connect("decoder",   "127.0.0.1", port_d)
+    decoder.connect("prefiller", "127.0.0.1", port_p)
+    time.sleep(0.1)
+    return prefiller, nixl_p, decoder, nixl_d
+
 
 def test_save_registers_job():
-    ctrl, nixl = MockCtrl(), MockNixl()
-    connector = PDConnector("prefiller-1", ctrl, nixl)
-
-    descs = [BlockDesc(block_hash=1, addr=0x1000, size=4096)]
-    connector.save("job1", descs)
-
-    assert "job1" in connector._save_jobs
-
-
-def test_load_sends_lookup_fetch():
-    ctrl, nixl = MockCtrl(), MockNixl()
-    connector = PDConnector("decoder-1", ctrl, nixl)
-
-    connector.load("job1", [1, 2, 3], "prefiller-1")
-
-    assert len(ctrl._sent) == 1
-    peer, msg = ctrl._sent[0]
-    assert peer == "prefiller-1"
-    assert msg["type"] == "lookup_fetch"
-    assert msg["job_id"] == "job1"
-    assert msg["block_hashes"] == [1, 2, 3]
+    prefiller, nixl_p, decoder, nixl_d = _make_pair(BASE_PORT, BASE_PORT + 1)
+    try:
+        descs = [BlockDesc(block_hash=1, addr=0x1000, size=4096)]
+        prefiller.save("job1", descs)
+        assert "job1" in prefiller._save_jobs
+    finally:
+        prefiller.close()
+        decoder.close()
 
 
-def test_lookup_fetch_triggers_nixl_write():
-    ctrl, nixl = MockCtrl(), MockNixl()
-    connector = PDConnector("prefiller-1", ctrl, nixl)
+def test_load_sends_lookup_fetch_and_triggers_nixl_write():
+    prefiller, nixl_p, decoder, nixl_d = _make_pair(BASE_PORT + 2, BASE_PORT + 3)
+    try:
+        descs = [BlockDesc(block_hash=1, addr=0x1000, size=4096)]
+        prefiller.save("job1", descs)
 
-    descs = [BlockDesc(block_hash=1, addr=0x1000, size=4096)]
-    connector.save("job1", descs)
+        decoder.load("job1", [1], "prefiller")
 
-    # Simulate decoder sending lookup_fetch
-    ctrl.deliver("decoder-1", {
-        "type":         "lookup_fetch",
-        "job_id":       "job1",
-        "block_hashes": [1],
-        "peer_id":      "decoder-1",
-    })
+        # Give listener time to process lookup_fetch
+        time.sleep(0.15)
 
-    # Give listener thread time to process
-    time.sleep(0.05)
-
-    assert len(nixl.writes) == 1
-    transfer_id, local, remote, peer = nixl.writes[0]
-    assert peer == "decoder-1"
-    assert local == descs
+        assert len(nixl_p.writes) == 1
+        transfer_id, local, remote, peer = nixl_p.writes[0]
+        assert peer == "decoder"
+        assert local == descs
+    finally:
+        prefiller.close()
+        decoder.close()
 
 
 def test_get_finished_returns_completed_jobs():
-    ctrl, nixl = MockCtrl(), MockNixl()
-    connector = PDConnector("prefiller-1", ctrl, nixl)
+    prefiller, nixl_p, decoder, nixl_d = _make_pair(BASE_PORT + 4, BASE_PORT + 5)
+    try:
+        descs = [BlockDesc(block_hash=1, addr=0x1000, size=4096)]
+        prefiller.save("job1", descs)
+        decoder.load("job1", [1], "prefiller")
+        time.sleep(0.15)
 
-    descs = [BlockDesc(block_hash=1, addr=0x1000, size=4096)]
-    connector.save("job1", descs)
+        assert prefiller.get_finished(["job1"]) == []
 
-    ctrl.deliver("decoder-1", {
-        "type":         "lookup_fetch",
-        "job_id":       "job1",
-        "block_hashes": [1],
-        "peer_id":      "decoder-1",
-    })
-    time.sleep(0.05)
-
-    # Not finished yet
-    assert connector.get_finished(["job1"]) == []
-
-    nixl.mark_finished("job1:nixl")
-    assert connector.get_finished(["job1"]) == ["job1"]
+        nixl_p.mark_finished("job1:nixl")
+        assert prefiller.get_finished(["job1"]) == ["job1"]
+    finally:
+        prefiller.close()
+        decoder.close()
 
 
 def test_abort_cancels_transfer():
-    ctrl, nixl = MockCtrl(), MockNixl()
-    connector = PDConnector("prefiller-1", ctrl, nixl)
+    prefiller, nixl_p, decoder, nixl_d = _make_pair(BASE_PORT + 6, BASE_PORT + 7)
+    try:
+        descs = [BlockDesc(block_hash=1, addr=0x1000, size=4096)]
+        prefiller.save("job1", descs)
+        decoder.load("job1", [1], "prefiller")
+        time.sleep(0.15)
 
-    descs = [BlockDesc(block_hash=1, addr=0x1000, size=4096)]
-    connector.save("job1", descs)
+        prefiller.abort("job1")
 
-    ctrl.deliver("decoder-1", {
-        "type":         "lookup_fetch",
-        "job_id":       "job1",
-        "block_hashes": [1],
-        "peer_id":      "decoder-1",
-    })
-    time.sleep(0.05)
+        assert "job1:nixl" in nixl_p.cancelled
+        assert prefiller.get_finished(["job1"]) == []
+    finally:
+        prefiller.close()
+        decoder.close()
 
-    connector.abort("job1")
 
-    assert "job1:nixl" in nixl.cancelled
-    assert connector.get_finished(["job1"]) == []
+def test_peer_down_aborts_load_jobs():
+    prefiller, nixl_p, decoder, nixl_d = _make_pair(BASE_PORT + 8, BASE_PORT + 9)
+    try:
+        decoder.load("job1", [1], "prefiller")
+        time.sleep(0.1)
+
+        # Simulate prefiller going down — decoder's on_peer_down fires
+        prefiller.close()
+        time.sleep(1.5)  # wait for heartbeat timeout
+
+        with decoder._lock:
+            job = decoder._load_jobs.get("job1")
+        assert job is not None
+        from src.pd_connector import _JobState
+        assert job.state == _JobState.ABORTED
+    finally:
+        decoder.close()

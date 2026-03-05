@@ -175,3 +175,42 @@ To run:
 cd /home/lirans/my-utils/pd-connector
 python3 -m pytest tests/test_pd_connector.py -v
 ```
+
+### Step 3: ZMQ CtrlTransport
+
+Implement `ZmqCtrlTransport` — a concrete `CtrlTransport` backed by ZMQ. The listener uses a ZMQ `ROUTER` socket so it can accept connections from multiple peers simultaneously. Each peer connects with a `DEALER` socket, and the router identifies peers by their socket identity.
+
+Peer liveness is tracked via a heartbeat mechanism. If a peer stops sending heartbeats within the timeout window, the transport fires a `on_peer_down(peer_id)` callback so that `PDConnector` can abort all in-progress jobs for that peer.
+
+```
+Peer A (DEALER) ──┐
+Peer B (DEALER) ──┼──► ZmqCtrlTransport (ROUTER) ──► PDConnector
+Peer C (DEALER) ──┘         │
+                        heartbeat monitor
+                        → on_peer_down(peer_id)
+```
+
+#### Design decisions
+- **Socket types**: `ROUTER` on the listener side, `DEALER` on the connecting side — allows multiplexing N peers on one port.
+- **Heartbeat**: each peer sends a periodic `{"type": "heartbeat", "peer_id": "..."}` message. The listener tracks `last_seen[peer_id]` and fires `on_peer_down` if a peer exceeds `heartbeat_timeout_s`.
+- **Message format**: MessagePack (msgspec) — consistent with the existing NIXL handshake wire format.
+- **Graceful disconnect**: a `{"type": "disconnect", "peer_id": "..."}` message triggers immediate `on_peer_down` without waiting for timeout.
+
+#### Tasks
+- [ ] Implement `ZmqCtrlTransport(CtrlTransport)` in `src/zmq_ctrl_transport.py`
+- [ ] Listener thread: ZMQ `ROUTER` socket, receives from any peer, dispatches to `recv()` queue
+- [ ] Sender: ZMQ `DEALER` socket per peer (lazily created), sends messages to a specific peer
+- [ ] Heartbeat sender: background thread sends heartbeat to each connected peer at `heartbeat_interval_s`
+- [ ] Heartbeat monitor: background thread checks `last_seen` and calls `on_peer_down(peer_id)` on timeout
+- [ ] Register `on_peer_down` callback in `PDConnector` to abort all jobs for the failed peer
+- [ ] Add unit tests in `tests/test_zmq_ctrl_transport.py`
+
+#### Tests
+
+Tests are located in `tests/test_zmq_ctrl_transport.py`.
+
+To run:
+```bash
+cd /home/lirans/my-utils/pd-connector
+python3 -m pytest tests/test_zmq_ctrl_transport.py -v
+```
