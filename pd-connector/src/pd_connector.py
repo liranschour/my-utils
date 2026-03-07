@@ -97,16 +97,27 @@ class PDConnector(SecondaryPillar):
         # so future transfers can be initiated using only block indices.
         self._agent = nixl_agent(peer_id, nixl_agent_config(backends=["UCX"]))
         if self._kv_blocks:
-            self._reg        = self._agent.register_memory(self._kv_blocks)
+            self._reg         = self._agent.register_memory(self._kv_blocks)
             self._local_dlist = self._agent.prep_xfer_dlist("NIXL_INIT_AGENT", self._kv_blocks)
         else:
             self._reg         = None
             self._local_dlist = None
 
+        # Pre-compute wire-format block descriptors so _connect() has nothing to calculate.
+        self._block_descs_wire: list[tuple[int, int, int]] = [
+            (t.data_ptr(), t.numel() * t.element_size(), max(t.get_device(), 0))
+            for t in self._kv_blocks
+        ]
+
         self._lock             = threading.Lock()
         self._save_jobs:       dict[str, _SaveJob] = {}
         self._load_jobs:       dict[str, _LoadJob] = {}
         self._transfer_to_job: dict[str, str] = {}
+
+        # Connection state (Step 6)
+        self._connections:    set[str]                 = set()
+        self._connect_events: dict[str, threading.Event] = {}
+        self._remote_dlists:  dict[str, object]        = {}  # peer_id → nixl_prepped_dlist_handle
 
         self._ctrl = ZmqCtrlTransport(
             peer_id, listen_port,
@@ -131,6 +142,11 @@ class PDConnector(SecondaryPillar):
 
     def close(self) -> None:
         self._ctrl.close()
+        with self._lock:
+            remote_dlists = list(self._remote_dlists.values())
+            self._remote_dlists.clear()
+        for dlist in remote_dlists:
+            self._agent.release_dlist_handle(dlist)
         if self._local_dlist is not None:
             self._agent.release_dlist_handle(self._local_dlist)
         if self._reg is not None:
@@ -146,7 +162,11 @@ class PDConnector(SecondaryPillar):
             self._save_jobs[job_id] = _SaveJob(job_id, block_descs)
 
     def load(self, job_id: str, block_hashes: list[int], peer_id: str) -> None:
-        """Decoder: send lookup_fetch to Prefiller and await NIXL transfer."""
+        """Decoder: connect to Prefiller if needed, then send lookup_fetch.
+
+        peer_id must be in "host:port" format pointing to the remote ZMQ listener.
+        """
+        self._ensure_connected(peer_id)
         with self._lock:
             self._load_jobs[job_id] = _LoadJob(job_id, block_hashes, peer_id)
 
@@ -185,14 +205,84 @@ class PDConnector(SecondaryPillar):
                     del self._transfer_to_job[tid]
 
     # ------------------------------------------------------------------
-    # Listener — Prefiller side
+    # Connection establishment (Step 6)
+    # ------------------------------------------------------------------
+
+    _CONNECT_TIMEOUT_S = 10.0
+
+    def _ensure_connected(self, peer_id: str) -> None:
+        """Connect and complete NIXL handshake with peer_id if not already done."""
+        with self._lock:
+            if peer_id in self._connections:
+                return
+            first = peer_id not in self._connect_events
+            if first:
+                self._connect_events[peer_id] = threading.Event()
+            event = self._connect_events[peer_id]
+
+        if first:
+            self._connect(peer_id)
+
+        if not event.wait(timeout=self._CONNECT_TIMEOUT_S):
+            raise TimeoutError(f"Handshake with {peer_id} timed out")
+
+    def _connect(self, peer_id: str) -> None:
+        """Open ZMQ channel to peer and send connect handshake message."""
+        host, port_str = peer_id.rsplit(":", 1)
+        self._ctrl.connect(peer_id, host, int(port_str))
+        self._ctrl.send(peer_id, {
+            "type":           "connect",
+            "peer_id":        self._peer_id,
+            "agent_metadata": self._agent.get_agent_metadata(),
+            "block_descs":    self._block_descs_wire,
+        })
+
+    # ------------------------------------------------------------------
+    # Listener — handles messages from both Prefiller and Decoder
     # ------------------------------------------------------------------
 
     def _listen(self) -> None:
         while True:
             sender_id, msg = self._ctrl.recv()
-            if msg.get("type") == "lookup_fetch":
+            mtype = msg.get("type")
+            if mtype == "connect":
+                self._handle_connect(sender_id, msg)
+            elif mtype == "connect_ack":
+                self._handle_connect_ack(sender_id, msg)
+            elif mtype == "lookup_fetch":
                 self._handle_lookup_fetch(sender_id, msg)
+
+    def _handle_connect(self, sender_id: str, msg: dict) -> None:
+        """Prefiller side: receive connect from Decoder, prep remote dlist, reply with ack."""
+        self._agent.add_remote_agent(msg["agent_metadata"])
+
+        block_descs = [tuple(d) for d in msg["block_descs"]]
+        remote_dlist = self._agent.prep_xfer_dlist(sender_id, block_descs, mem_type="cpu")
+
+        with self._lock:
+            self._remote_dlists[sender_id] = remote_dlist
+            self._connections.add(sender_id)
+
+        # Connect back so we can reply (and for future NIXL transfers)
+        decoder_peer_id = msg["peer_id"]
+        host, port_str = decoder_peer_id.rsplit(":", 1)
+        self._ctrl.connect(decoder_peer_id, host, int(port_str))
+
+        self._ctrl.send(decoder_peer_id, {
+            "type":    "connect_ack",
+            "peer_id": self._peer_id,
+            # No agent_metadata: Decoder is the WRITE target, not the initiator,
+            # so it does not need to call add_remote_agent on the Prefiller.
+        })
+
+    def _handle_connect_ack(self, sender_id: str, _msg: dict) -> None:
+        """Decoder side: receive connect_ack and signal handshake done.
+        No add_remote_agent call: Decoder is the WRITE target, not the initiator."""
+        with self._lock:
+            self._connections.add(sender_id)
+            event = self._connect_events.get(sender_id)
+        if event:
+            event.set()
 
     def _handle_lookup_fetch(self, decoder_peer_id: str, msg: dict) -> None:
         job_id       = msg["job_id"]
@@ -216,11 +306,15 @@ class PDConnector(SecondaryPillar):
 
     def _on_peer_down(self, peer_id: str) -> None:
         with self._lock:
+            self._connections.discard(peer_id)
+            dlist = self._remote_dlists.pop(peer_id, None)
             affected = [
                 jid for jid, job in self._load_jobs.items()
                 if job.peer_id == peer_id
                 and job.state not in (_JobState.DONE, _JobState.ABORTED)
             ]
+        if dlist is not None:
+            self._agent.release_dlist_handle(dlist)
         for jid in affected:
             self.abort(jid)
 

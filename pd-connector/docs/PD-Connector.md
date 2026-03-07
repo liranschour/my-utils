@@ -286,7 +286,9 @@ self._agent.deregister_memory(self._reg)
 
 ### Step 6: Connection Establishment
 
-When `load()` is called for a peer not yet connected, establish a ZMQ control channel connection and exchange NIXL agent metadata and block descriptors. This gives the Prefiller everything it needs to prep a remote descriptor list (`remote_dlist`) for the Decoder's KV blocks so that `make_prepped_xfer` can be called using only indices.
+When `load()` is called for a peer not yet connected, establish a ZMQ control channel connection. The Decoder sends its NIXL agent metadata and KV block descriptors to the Prefiller. The Prefiller uses these to prep a remote descriptor list (`remote_dlist`) so that future `make_prepped_xfer` transfers need only block indices.
+
+The Prefiller does **not** send its metadata back. The Decoder is the WRITE target, not the initiator — `add_remote_agent` is only required on the side that initiates transfers (Prefiller).
 
 #### peer_id format
 
@@ -298,13 +300,12 @@ When `load()` is called for a peer not yet connected, establish a ZMQ control ch
 Decoder ──connect msg──► Prefiller
          {type: "connect",
           peer_id: decoder_id,
-          agent_metadata: <bytes>,   # Decoder's NIXL metadata
-          block_descs: [[addr,len,dev_id], ...]}  # Decoder's kv_blocks as Nx3 array
+          agent_metadata: <bytes>,        # Decoder's NIXL metadata (needed by Prefiller to WRITE)
+          block_descs: [[addr,len,dev_id], ...]}  # Decoder's kv_blocks as list of 3-tuples
 
 Decoder ◄──connect_ack── Prefiller
          {type: "connect_ack",
-          peer_id: prefiller_id,
-          agent_metadata: <bytes>}   # Prefiller's NIXL metadata
+          peer_id: prefiller_id}          # No metadata: Decoder does not initiate transfers
 ```
 
 The Decoder blocks in `_connect()` until the `connect_ack` arrives (per-peer `threading.Event`, with timeout).
@@ -322,19 +323,19 @@ The Decoder blocks in `_connect()` until the `connect_ack` arrives (per-peer `th
 **Decoder side** (`load()` → `_connect(peer_id)`):
 1. Parse `host, port = peer_id.rsplit(":", 1)`
 2. `self._ctrl.connect(peer_id, host, int(port))`
-3. Send `connect` message with `self._agent.get_agent_metadata()` and `self._agent.get_xfer_descs(self._kv_blocks)` serialised as an Nx3 array
+3. Send `connect` message with `self._agent.get_agent_metadata()` and kv_blocks as `[(addr, nbytes, dev_id), ...]`
 4. Wait on `self._connect_events[peer_id]` (timeout = 10 s)
 5. Mark `peer_id` in `self._connections`
 
 **Prefiller side** (listener handles `connect`):
-1. `self._agent.add_remote_agent(msg["agent_metadata"])`
-2. `self._remote_dlists[sender_id] = self._agent.prep_xfer_dlist(sender_id, msg["block_descs"])`
-3. Mark `sender_id` in `self._connections`
-4. Reply with `connect_ack` carrying `self._agent.get_agent_metadata()`
+1. `self._agent.add_remote_agent(msg["agent_metadata"])` — Prefiller learns Decoder's transport endpoints
+2. `self._remote_dlists[sender_id] = self._agent.prep_xfer_dlist(sender_id, block_descs, mem_type="cpu")`
+3. Connect back to Decoder's ZMQ listener, mark `sender_id` in `self._connections`
+4. Reply with `connect_ack` — **no metadata included**
 
 **Decoder side** (listener handles `connect_ack`):
-1. `self._agent.add_remote_agent(msg["agent_metadata"])`
-2. Set `self._connect_events[sender_id]`
+1. Mark `sender_id` in `self._connections`
+2. Set `self._connect_events[sender_id]` — unblocks `_ensure_connected`
 
 #### On peer down
 
@@ -345,8 +346,8 @@ The Decoder blocks in `_connect()` until the `connect_ack` arrives (per-peer `th
 - [ ] Add `_connections: set[str]`, `_connect_events: dict[str, threading.Event]`, `_remote_dlists: dict[str, nixl_prepped_dlist_handle]`
 - [ ] `load()`: if `peer_id` not in `_connections`, call `_connect(peer_id)` before sending `lookup_fetch`
 - [ ] Implement `_connect(peer_id)`: parse host/port, ZMQ connect, send `connect` message, wait on event
-- [ ] Listener handles `connect`: `add_remote_agent`, `prep_xfer_dlist` → `_remote_dlists`, send `connect_ack`
-- [ ] Listener handles `connect_ack`: `add_remote_agent`, set event
+- [ ] Listener handles `connect`: `add_remote_agent`, `prep_xfer_dlist` → `_remote_dlists`, send `connect_ack` (no metadata)
+- [ ] Listener handles `connect_ack`: set event (no `add_remote_agent`)
 - [ ] `_on_peer_down()`: clear `_connections` entry, release and remove `_remote_dlists` entry
 - [ ] `close()`: release all `_remote_dlists` handles
 - [ ] Add integration test: two connectors, `load()` triggers handshake, verify both sides have `_connections` populated and Prefiller has `_remote_dlists` entry
