@@ -211,7 +211,30 @@ cd /home/lirans/my-utils/pd-connector
 python3 -m pytest tests/test_zmq_ctrl_transport.py -v
 ```
 
-### Step 4: NIXL Transfer
+### Step 4: Register Memory
+
+Accept CPU KV block tensors at `PDConnector` init time and store them for later NIXL registration (which happens in Step 5). No NIXL calls are made in this step.
+
+#### Design
+
+`PDConnector.__init__()` receives a `kv_blocks: list[torch.Tensor]` argument representing the CPU KV cache blocks allocated by the OffloadingManager. The tensors are stored as `self._kv_blocks` for use in the NIXL registration step.
+
+#### Tasks
+- [ ] Add `kv_blocks: list[torch.Tensor]` parameter to `PDConnector.__init__()`
+- [ ] Store as `self._kv_blocks = kv_blocks`
+- [ ] Add unit test in `tests/test_pd_connector.py` verifying that tensors passed at init are accessible via `self._kv_blocks`
+
+#### Tests
+
+Tests are located in `tests/test_pd_connector.py`.
+
+To run:
+```bash
+cd /home/lirans/my-utils/pd-connector
+python3 -m pytest tests/test_pd_connector.py -v
+```
+
+### Step 5: NIXL Transfer
 
 Replace the `NixlTransport` abstraction with a direct `nixl_agent` implementation inside `PDConnector`. No wrapper class — NIXL calls are made inline.
 

@@ -13,6 +13,7 @@ import threading
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum, auto
+import torch
 
 from src.secondary_pillar import BlockDesc, SecondaryPillar
 from src.zmq_ctrl_transport import ZmqCtrlTransport
@@ -82,11 +83,13 @@ class PDConnector(SecondaryPillar):
         peer_id: str,
         listen_port: int,
         nixl: NixlTransport,
+        kv_blocks: list[torch.Tensor] | None = None,
         heartbeat_ivl_ms:     int = 2000,
         heartbeat_timeout_ms: int = 10000,
     ) -> None:
-        self._peer_id = peer_id
-        self._nixl    = nixl
+        self._peer_id  = peer_id
+        self._nixl     = nixl
+        self._kv_blocks: list[torch.Tensor] = kv_blocks if kv_blocks is not None else []
 
         self._lock             = threading.Lock()
         self._save_jobs:       dict[str, _SaveJob] = {}

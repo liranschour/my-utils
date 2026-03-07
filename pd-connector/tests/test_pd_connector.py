@@ -1,5 +1,6 @@
 import time
 import pytest
+import torch
 
 from src.secondary_pillar import BlockDesc
 from src.pd_connector import NixlTransport, PDConnector
@@ -38,6 +39,26 @@ def _make_pair(port_p: int, port_d: int):
     decoder.connect("prefiller", "127.0.0.1", port_p)
     time.sleep(0.1)
     return prefiller, nixl_p, decoder, nixl_d
+
+
+def test_kv_blocks_stored_at_init():
+    blocks = [torch.zeros(128, dtype=torch.float16) for _ in range(4)]
+    nixl = MockNixl()
+    connector = PDConnector("node0", BASE_PORT - 2, nixl, kv_blocks=blocks)
+    try:
+        assert connector._kv_blocks is blocks
+        assert len(connector._kv_blocks) == 4
+    finally:
+        connector.close()
+
+
+def test_kv_blocks_defaults_to_empty():
+    nixl = MockNixl()
+    connector = PDConnector("node0", BASE_PORT - 1, nixl)
+    try:
+        assert connector._kv_blocks == []
+    finally:
+        connector.close()
 
 
 def test_save_registers_job():
