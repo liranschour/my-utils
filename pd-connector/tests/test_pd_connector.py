@@ -3,7 +3,7 @@ import pytest
 import torch
 
 from src.secondary_pillar import BlockDesc
-from src.pd_connector import NixlTransport, PDConnector
+from src.pd_connector import NixlTransport, PDConnector, _JobState
 
 BASE_PORT = 15300
 
@@ -96,58 +96,81 @@ def test_save_registers_job():
         decoder.close()
 
 
-def test_load_sends_lookup_fetch_and_triggers_nixl_write():
+def test_load_ack_advances_to_transfer_state():
+    """After lookup_ack, job moves from PENDING to TRANSFER (not yet DONE)."""
     port_p, port_d = BASE_PORT + 2, BASE_PORT + 3
     prefiller, nixl_p, decoder, nixl_d = _make_pair(port_p, port_d)
     try:
-        descs = [BlockDesc(block_hash=1, addr=0x1000, size=4096)]
-        prefiller.save("job1", descs)
-
+        prefiller.save("job1", [BlockDesc(block_hash=1, addr=0x1000, size=4096)])
         decoder.load("job1", [1], _peer_id(port_p))
 
-        # Give listener time to process handshake + lookup_fetch
-        time.sleep(0.3)
+        # Job starts in PENDING (waiting for ack)
+        with decoder._lock:
+            assert decoder._load_jobs["job1"].state == _JobState.PENDING
 
-        assert len(nixl_p.writes) == 1
-        transfer_id, local, remote, peer = nixl_p.writes[0]
-        assert peer == _peer_id(port_d)
-        assert local == descs
+        # After ack arrives, job advances to TRANSFER
+        time.sleep(0.3)
+        with decoder._lock:
+            assert decoder._load_jobs["job1"].state == _JobState.TRANSFER
+
+        # Not DONE — data transfer has not occurred
+        assert decoder.get_finished(["job1"]) == []
     finally:
         prefiller.close()
         decoder.close()
 
 
-def test_get_finished_returns_completed_jobs():
+def test_load_control_failure_no_save():
+    """No save on Prefiller → no lookup_ack → ack_deadline fires → ABORTED (control failure)."""
     port_p, port_d = BASE_PORT + 4, BASE_PORT + 5
     prefiller, nixl_p, decoder, nixl_d = _make_pair(port_p, port_d)
     try:
-        descs = [BlockDesc(block_hash=1, addr=0x1000, size=4096)]
-        prefiller.save("job1", descs)
-        decoder.load("job1", [1], _peer_id(port_p))
-        time.sleep(0.3)
+        decoder._LOOKUP_ACK_TIMEOUT_S = 0.3
+        decoder.load("job1", [1], _peer_id(port_p))  # no prefiller.save()
 
-        assert prefiller.get_finished(["job1"]) == []
+        time.sleep(0.6)
 
-        nixl_p.mark_finished("job1:nixl")
-        assert prefiller.get_finished(["job1"]) == ["job1"]
+        assert decoder.get_finished(["job1"]) == []
+        with decoder._lock:
+            assert decoder._load_jobs["job1"].state == _JobState.ABORTED
     finally:
         prefiller.close()
         decoder.close()
 
 
-def test_abort_cancels_transfer():
+def test_load_transfer_failure_after_ack():
+    """Ack received but no NIXL transfer → xfer_deadline fires → ABORTED (transfer failure)."""
     port_p, port_d = BASE_PORT + 6, BASE_PORT + 7
     prefiller, nixl_p, decoder, nixl_d = _make_pair(port_p, port_d)
     try:
-        descs = [BlockDesc(block_hash=1, addr=0x1000, size=4096)]
-        prefiller.save("job1", descs)
+        prefiller.save("job1", [BlockDesc(block_hash=1, addr=0x1000, size=4096)])
+        decoder._TRANSFER_TIMEOUT_S = 0.3
         decoder.load("job1", [1], _peer_id(port_p))
+
+        # Wait for ack then for xfer deadline to pass
+        time.sleep(0.8)
+
+        assert decoder.get_finished(["job1"]) == []
+        with decoder._lock:
+            assert decoder._load_jobs["job1"].state == _JobState.ABORTED
+    finally:
+        prefiller.close()
+        decoder.close()
+
+
+def test_abort_prevents_job_completion():
+    port_p, port_d = BASE_PORT + 8, BASE_PORT + 9
+    prefiller, nixl_p, decoder, nixl_d = _make_pair(port_p, port_d)
+    try:
+        prefiller.save("job1", [BlockDesc(block_hash=1, addr=0x1000, size=4096)])
+        decoder.load("job1", [1], _peer_id(port_p))
+
+        decoder.abort("job1")
+
         time.sleep(0.3)
-
-        prefiller.abort("job1")
-
-        assert "job1:nixl" in nixl_p.cancelled
-        assert prefiller.get_finished(["job1"]) == []
+        assert decoder.get_finished(["job1"]) == []
+        with decoder._lock:
+            assert decoder._load_jobs["job1"].state == _JobState.ABORTED
     finally:
         prefiller.close()
         decoder.close()
@@ -170,7 +193,7 @@ def test_load_auto_connects_and_handshakes():
 
 
 def test_peer_down_aborts_load_jobs():
-    port_p, port_d = BASE_PORT + 8, BASE_PORT + 9
+    port_p, port_d = BASE_PORT + 12, BASE_PORT + 13
     prefiller, nixl_p, decoder, nixl_d = _make_pair(port_p, port_d)
     try:
         decoder.load("job1", [1], _peer_id(port_p))
@@ -183,7 +206,6 @@ def test_peer_down_aborts_load_jobs():
         with decoder._lock:
             job = decoder._load_jobs.get("job1")
         assert job is not None
-        from src.pd_connector import _JobState
         assert job.state == _JobState.ABORTED
     finally:
         decoder.close()

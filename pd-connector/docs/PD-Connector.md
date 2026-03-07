@@ -349,3 +349,108 @@ To run:
 cd /home/lirans/my-utils/pd-connector
 python3 -m pytest tests/test_pd_connector.py -v
 ```
+
+### Step 7: Lookup-Fetch with Two-Phase Timeout
+
+When the Decoder calls `load()`, it sends a `lookup_fetch` control message to the Prefiller. The Prefiller replies with `lookup_ack` to confirm the control message was received and the job exists. `lookup_ack` does **not** mean data has been transferred — it is only a control-plane confirmation.
+
+This creates two distinct failure modes, which must be tracked separately:
+
+| Failure | Cause |
+|---|---|
+| No `lookup_ack` before `ack_deadline` | Control message was lost, or Prefiller does not have the job registered |
+| `lookup_ack` received but no transfer complete before `xfer_deadline` | Data transfer did not occur (NIXL not implemented yet in this step) |
+
+No NIXL data transfer occurs in this step. Jobs always time out at the transfer phase.
+
+#### Message format
+
+`lookup_fetch` (Decoder → Prefiller):
+```
+{
+  "type":         "lookup_fetch",
+  "job_id":       <str>,
+  "block_hashes": [<int>, ...]
+}
+```
+
+`lookup_ack` (Prefiller → Decoder):
+```
+{
+  "type":    "lookup_ack",
+  "job_id":  <str>
+}
+```
+
+#### Two-phase deadline tracking
+
+```
+load() called
+    │
+    ├─ ack_deadline = now + _LOOKUP_ACK_TIMEOUT_S
+    │
+    ▼
+[waiting for lookup_ack]
+    │
+    ├── ack_deadline exceeded → ABORTED  (control failure: message lost or job not found)
+    │
+    ▼ lookup_ack received
+    │
+    ├─ xfer_deadline = now + _TRANSFER_TIMEOUT_S
+    │
+    ▼
+[waiting for transfer complete]  ← future step will resolve this
+    │
+    ├── xfer_deadline exceeded → ABORTED  (transfer failure: data did not arrive)
+    │
+    └── transfer complete → DONE
+```
+
+#### Flow
+
+**Decoder** (`load()`):
+1. Verify an active connection via `_ensure_connected(peer_id)`. If handshake times out, raise immediately.
+2. Create `_LoadJob` with `ack_deadline = now + _LOOKUP_ACK_TIMEOUT_S`.
+3. Send `lookup_fetch` with `job_id` and `block_hashes`.
+
+**Prefiller** (handles `lookup_fetch`):
+1. Look up `_save_jobs[job_id]`. If not found or aborted, return (NACK is a future step).
+2. Reply with `lookup_ack` to the Decoder.
+
+**Decoder** (handles `lookup_ack`):
+1. Record `ack_received = True`.
+2. Set `xfer_deadline = now + _TRANSFER_TIMEOUT_S`.
+3. Do **not** mark job as DONE — data transfer has not occurred yet.
+
+**Decoder `get_finished()`**:
+- If `not ack_received` and `now > ack_deadline`: abort — control failure.
+- If `ack_received` and `now > xfer_deadline`: abort — transfer failure.
+- Return jobs in DONE state (transfer completion is a future step).
+
+#### State added
+
+| Field | Type | Description |
+|---|---|---|
+| `_LoadJob.ack_received` | `bool` | True once `lookup_ack` has been received |
+| `_LoadJob.ack_deadline` | `float` | Deadline for receiving `lookup_ack`; exceeded → control failure |
+| `_LoadJob.xfer_deadline` | `float` | Set on ack receipt; exceeded → transfer failure |
+
+#### Tasks
+- [ ] `_LoadJob`: add `ack_received: bool = False`, `ack_deadline: float`, `xfer_deadline: float = 0.0`
+- [ ] `load()`: set `ack_deadline = now + _LOOKUP_ACK_TIMEOUT_S`; send `lookup_fetch`
+- [ ] `_handle_lookup_fetch` (Prefiller): send `lookup_ack` back to Decoder
+- [ ] `_handle_lookup_ack` (Decoder): set `ack_received = True`, `xfer_deadline = now + _TRANSFER_TIMEOUT_S`; do NOT mark DONE
+- [ ] `get_finished()`: abort on ack timeout (control failure) or xfer timeout (transfer failure); return DONE jobs
+- [ ] Add `_LOOKUP_ACK_TIMEOUT_S` and `_TRANSFER_TIMEOUT_S` class constants
+- [ ] Test: load with no matching save → no ack → ack_deadline fires → ABORTED (control failure)
+- [ ] Test: load with matching save → ack received → no transfer → xfer_deadline fires → ABORTED (transfer failure)
+
+#### Tests
+
+Tests are located in `tests/test_pd_connector.py`.
+
+To run:
+```bash
+cd /home/lirans/my-utils/pd-connector
+python3 -m pytest tests/test_pd_connector.py -v
+```
