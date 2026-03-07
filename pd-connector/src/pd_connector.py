@@ -5,8 +5,11 @@ Prefiller and Decoder nodes via ZMQ control channel + NIXL data transfer.
 Roles:
   Prefiller side: save() registers block descriptors; the listener thread
                   handles incoming lookup_fetch requests and sends lookup_ack.
+                  On save(), if a matching lookup_fetch exists, initiates NIXL
+                  WRITE and sends transfer_done per chunk when complete.
   Decoder side:   load() connects to the Prefiller peer, sends lookup_fetch,
-                  and waits for lookup_ack within a deadline.
+                  and waits for lookup_ack within a deadline. Accumulates
+                  transfer_done messages until all blocks received → DONE.
 """
 
 import threading
@@ -62,7 +65,7 @@ class _JobState(Enum):
 @dataclass
 class _SaveJob:
     job_id: str
-    block_descs: list[BlockDesc]
+    hash_to_desc: dict[int, BlockDesc] = field(default_factory=dict)
     state: _JobState = _JobState.PENDING
 
 
@@ -75,6 +78,16 @@ class _LoadJob:
     ack_deadline: float = 0.0   # exceeded with no ack → control failure
     xfer_deadline: float = 0.0  # set on ack; exceeded → transfer failure
     state: _JobState = _JobState.PENDING
+    received_hashes: set[int] = field(default_factory=set)
+
+
+@dataclass
+class _PendingFetch:
+    """Prefiller-side state for a lookup_fetch request from the Decoder."""
+    job_id: str
+    decoder_peer_id: str
+    hash_to_remote_idx: dict[int, int]  # block_hash → Decoder kv_block slot
+    remaining_hashes: set[int]          # hashes not yet transferred
 
 
 # ---------------------------------------------------------------------------
@@ -112,14 +125,25 @@ class PDConnector(SecondaryPillar):
             for t in self._kv_blocks
         ]
 
+        # addr → local kv_block index (for fast lookup during _try_transfer)
+        self._addr_to_idx: dict[int, int] = {
+            t.data_ptr(): i for i, t in enumerate(self._kv_blocks)
+        }
+
         self._lock       = threading.Lock()
         self._save_jobs: dict[str, _SaveJob] = {}
         self._load_jobs: dict[str, _LoadJob] = {}
 
-        # Connection state (Step 6)
-        self._connections:    set[str]                 = set()
+        # Prefiller-side pending fetch state
+        self._pending_fetches: dict[str, _PendingFetch] = {}  # job_id → _PendingFetch
+
+        # In-flight NIXL transfer handles: (handle, job_id, chunk_hashes, decoder_peer_id)
+        self._xfer_handles: list[tuple] = []
+
+        # Connection state
+        self._connections:    set[str]                    = set()
         self._connect_events: dict[str, threading.Event] = {}
-        self._remote_dlists:  dict[str, object]        = {}  # peer_id → nixl_prepped_dlist_handle
+        self._remote_dlists:  dict[str, object]          = {}  # peer_id → nixl_prepped_dlist_handle
 
         self._ctrl = ZmqCtrlTransport(
             peer_id, listen_port,
@@ -147,8 +171,12 @@ class PDConnector(SecondaryPillar):
         with self._lock:
             remote_dlists = list(self._remote_dlists.values())
             self._remote_dlists.clear()
+            xfer_handles = [h for h, *_ in self._xfer_handles]
+            self._xfer_handles.clear()
         for dlist in remote_dlists:
             self._agent.release_dlist_handle(dlist)
+        for handle in xfer_handles:
+            self._agent.release_xfer_handle(handle)
         if self._local_dlist is not None:
             self._agent.release_dlist_handle(self._local_dlist)
         if self._reg is not None:
@@ -159,9 +187,17 @@ class PDConnector(SecondaryPillar):
     # ------------------------------------------------------------------
 
     def save(self, job_id: str, block_descs: list[BlockDesc]) -> None:
-        """Prefiller: register blocks as ready to serve lookup_fetch."""
+        """Prefiller: register blocks as ready to serve lookup_fetch.
+
+        Blocks are accumulated incrementally (streaming support). After
+        updating, attempt to transfer any matching blocks to waiting Decoders.
+        """
         with self._lock:
-            self._save_jobs[job_id] = _SaveJob(job_id, block_descs)
+            job = self._save_jobs.setdefault(job_id, _SaveJob(job_id=job_id))
+            for desc in block_descs:
+                job.hash_to_desc[desc.block_hash] = desc
+
+        self._try_transfer(job_id)
 
     def load(self, job_id: str, block_hashes: list[int], block_indexes: list[int], peer_id: str) -> None:
         """Decoder: connect to Prefiller if needed, then send lookup_fetch.
@@ -192,6 +228,8 @@ class PDConnector(SecondaryPillar):
         })
 
     def get_finished(self, job_ids: list[str]) -> list[str]:
+        self._poll_xfer_handles()
+
         now = time.monotonic()
         with self._lock:
             for job in self._load_jobs.values():
@@ -210,7 +248,7 @@ class PDConnector(SecondaryPillar):
                 self._save_jobs[job_id].state = _JobState.ABORTED
 
     # ------------------------------------------------------------------
-    # Connection establishment (Step 6)
+    # Connection establishment
     # ------------------------------------------------------------------
 
     _CONNECT_TIMEOUT_S    = 10.0
@@ -245,6 +283,101 @@ class PDConnector(SecondaryPillar):
         })
 
     # ------------------------------------------------------------------
+    # NIXL transfer (Prefiller side)
+    # ------------------------------------------------------------------
+
+    def _try_transfer(self, job_id: str) -> None:
+        """Initiate NIXL WRITE for any blocks that are both saved and pending fetch.
+
+        Called from save() after accumulating new blocks. Matches saved hashes
+        against the pending fetch's remaining_hashes, builds index lists, starts
+        the transfer, and removes matched hashes from remaining_hashes.
+        """
+        with self._lock:
+            save_job = self._save_jobs.get(job_id)
+            fetch    = self._pending_fetches.get(job_id)
+            if save_job is None or fetch is None:
+                return
+            if save_job.state == _JobState.ABORTED:
+                return
+
+            # Find hashes that are both saved and still waiting to be transferred
+            ready = fetch.remaining_hashes & save_job.hash_to_desc.keys()
+            if not ready:
+                return
+
+            # Build parallel local/remote index lists
+            local_indices  = []
+            remote_indices = []
+            chunk_hashes   = []
+            for h in ready:
+                desc = save_job.hash_to_desc[h]
+                local_idx = self._addr_to_idx.get(desc.addr)
+                if local_idx is None:
+                    continue
+                remote_idx = fetch.hash_to_remote_idx[h]
+                local_indices.append(local_idx)
+                remote_indices.append(remote_idx)
+                chunk_hashes.append(h)
+
+            if not chunk_hashes:
+                return
+
+            remote_dlist   = self._remote_dlists.get(fetch.decoder_peer_id)
+            decoder_peer_id = fetch.decoder_peer_id
+
+            fetch.remaining_hashes -= set(chunk_hashes)
+
+        if remote_dlist is None or self._local_dlist is None:
+            return
+
+        handle = self._agent.make_prepped_xfer(
+            "NIXL_WRITE",
+            self._local_dlist,
+            local_indices,
+            remote_dlist,
+            remote_indices,
+        )
+        state = self._agent.transfer(handle)
+
+        with self._lock:
+            if state == "ERR":
+                self._agent.release_xfer_handle(handle)
+            else:
+                self._xfer_handles.append((handle, job_id, chunk_hashes, decoder_peer_id))
+
+    def _poll_xfer_handles(self) -> None:
+        """Check all in-flight NIXL transfers; send transfer_done for completed ones."""
+        with self._lock:
+            pending = list(self._xfer_handles)
+
+        still_in_flight = []
+        for entry in pending:
+            handle, job_id, chunk_hashes, decoder_peer_id = entry
+            state = self._agent.check_xfer_state(handle)
+            if state == "PROC":
+                still_in_flight.append(entry)
+                continue
+
+            self._agent.release_xfer_handle(handle)
+
+            if state == "DONE":
+                self._ctrl.send(decoder_peer_id, {
+                    "type":        "transfer_done",
+                    "job_id":      job_id,
+                    "block_hashes": chunk_hashes,
+                })
+            # ERR: transfer failed — Decoder's xfer_deadline will fire eventually
+
+        with self._lock:
+            # Replace list preserving any entries added concurrently
+            completed_handles = {id(e[0]) for e in pending if e not in still_in_flight}
+            self._xfer_handles = [
+                e for e in self._xfer_handles
+                if id(e[0]) not in completed_handles
+            ]
+
+    # ------------------------------------------------------------------
     # Listener — handles messages from both Prefiller and Decoder
     # ------------------------------------------------------------------
 
@@ -260,6 +393,8 @@ class PDConnector(SecondaryPillar):
                 self._handle_lookup_fetch(sender_id, msg)
             elif mtype == "lookup_ack":
                 self._handle_lookup_ack(sender_id, msg)
+            elif mtype == "transfer_done":
+                self._handle_transfer_done(sender_id, msg)
 
     def _handle_connect(self, sender_id: str, msg: dict) -> None:
         """Prefiller side: receive connect from Decoder, prep remote dlist, reply with ack."""
@@ -294,22 +429,35 @@ class PDConnector(SecondaryPillar):
             event.set()
 
     def _handle_lookup_fetch(self, sender_id: str, msg: dict) -> None:
-        """Prefiller side: receive lookup_fetch, verify save_job exists, send lookup_ack."""
-        job_id = msg["job_id"]
+        """Prefiller side: receive lookup_fetch, create PendingFetch, send ack.
 
-        with self._lock:
-            save_job = self._save_jobs.get(job_id)
-            if save_job is None or save_job.state == _JobState.ABORTED:
-                return  # TODO: send NACK
-
+        The ack is sent immediately — it confirms message receipt, not data transfer.
+        If blocks are already saved, _try_transfer initiates the NIXL write right away.
+        """
+        job_id       = msg["job_id"]
+        block_hashes = msg["block_hashes"]
+        block_indexes = msg["block_indexes"]
         decoder_peer_id = msg["peer_id"]
+
+        fetch = _PendingFetch(
+            job_id=job_id,
+            decoder_peer_id=decoder_peer_id,
+            hash_to_remote_idx=dict(zip(block_hashes, block_indexes)),
+            remaining_hashes=set(block_hashes),
+        )
+        with self._lock:
+            self._pending_fetches[job_id] = fetch
+
         self._ctrl.send(decoder_peer_id, {
             "type":   "lookup_ack",
             "job_id": job_id,
         })
 
+        # If blocks are already saved, initiate transfer immediately
+        self._try_transfer(job_id)
+
     def _handle_lookup_ack(self, sender_id: str, msg: dict) -> None:
-        """Decoder side: receive lookup_ack — confirms Prefiller has the job.
+        """Decoder side: receive lookup_ack — confirms Prefiller received the job.
         Advances from PENDING to TRANSFER and starts the transfer deadline.
         Does NOT mark DONE: data transfer has not occurred yet."""
         job_id = msg["job_id"]
@@ -318,6 +466,18 @@ class PDConnector(SecondaryPillar):
             if job and job.state == _JobState.PENDING:
                 job.xfer_deadline = time.monotonic() + self._TRANSFER_TIMEOUT_S
                 job.state = _JobState.TRANSFER
+
+    def _handle_transfer_done(self, _sender_id: str, msg: dict) -> None:
+        """Decoder side: accumulate received block hashes; mark DONE when all received."""
+        job_id       = msg["job_id"]
+        chunk_hashes = set(msg["block_hashes"])
+        with self._lock:
+            job = self._load_jobs.get(job_id)
+            if job is None or job.state != _JobState.TRANSFER:
+                return
+            job.received_hashes |= chunk_hashes
+            if job.received_hashes >= set(job.block_hashes):
+                job.state = _JobState.DONE
 
     def _on_peer_down(self, peer_id: str) -> None:
         with self._lock:

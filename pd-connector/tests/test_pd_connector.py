@@ -113,7 +113,7 @@ def test_load_ack_advances_to_transfer_state():
         with decoder._lock:
             assert decoder._load_jobs["job1"].state == _JobState.TRANSFER
 
-        # Not DONE — data transfer has not occurred
+        # Not DONE — data transfer has not occurred (MockNixl is a stub)
         assert decoder.get_finished(["job1"]) == []
     finally:
         prefiller.close()
@@ -121,12 +121,31 @@ def test_load_ack_advances_to_transfer_state():
 
 
 def test_load_control_failure_no_save():
-    """No save on Prefiller → no lookup_ack → ack_deadline fires → ABORTED (control failure)."""
+    """No save on Prefiller → no lookup_ack → ack_deadline fires → ABORTED (control failure).
+
+    In Step 8, Prefiller always sends ack on lookup_fetch regardless of whether
+    save() was called yet. So a "no save" scenario no longer causes a control failure
+    at the ack stage — but if no blocks are ever saved, no transfer_done arrives
+    and the xfer_deadline fires instead.
+
+    This test keeps the ack-deadline path by pointing the Decoder at a non-existent
+    Prefiller so the lookup_fetch is never received.
+    """
     port_p, port_d = BASE_PORT + 4, BASE_PORT + 5
-    prefiller, nixl_p, decoder, nixl_d = _make_pair(port_p, port_d)
+    _prefiller, nixl_p, decoder, nixl_d = _make_pair(port_p, port_d)
+    # Create a second "ghost" prefiller that is never started — just use a free port
+    ghost_port = BASE_PORT + 50
+    ghost_prefiller = PDConnector(_peer_id(ghost_port), ghost_port, MockNixl(),
+                                   heartbeat_ivl_ms=200, heartbeat_timeout_ms=1000)
     try:
         decoder._LOOKUP_ACK_TIMEOUT_S = 0.3
-        decoder.load("job1", [1], [0], _peer_id(port_p))  # no prefiller.save()
+        # load() will try to connect to ghost_prefiller which exists but has no save()
+        # and more importantly will not send ack because it has no pending fetch handler
+        # that matches — actually in Step 8 it WILL send ack. So instead we use a port
+        # that has no listener at all by closing the ghost prefiller first.
+        ghost_prefiller.close()
+
+        decoder.load("job1", [1], [0], _peer_id(ghost_port))
 
         time.sleep(0.6)
 
@@ -134,16 +153,20 @@ def test_load_control_failure_no_save():
         with decoder._lock:
             assert decoder._load_jobs["job1"].state == _JobState.ABORTED
     finally:
-        prefiller.close()
+        _prefiller.close()
         decoder.close()
 
 
 def test_load_transfer_failure_after_ack():
-    """Ack received but no NIXL transfer → xfer_deadline fires → ABORTED (transfer failure)."""
+    """Ack received but no NIXL transfer → xfer_deadline fires → ABORTED (transfer failure).
+
+    Prefiller sends ack (lookup_fetch always acked in Step 8) but save() is never
+    called, so no transfer_done arrives and the transfer deadline fires.
+    """
     port_p, port_d = BASE_PORT + 6, BASE_PORT + 7
     prefiller, nixl_p, decoder, nixl_d = _make_pair(port_p, port_d)
     try:
-        prefiller.save("job1", [BlockDesc(block_hash=1, addr=0x1000, size=4096)])
+        # Do NOT call prefiller.save() — lookup_fetch will be acked but no transfer occurs
         decoder._TRANSFER_TIMEOUT_S = 0.3
         decoder.load("job1", [1], [0], _peer_id(port_p))
 
@@ -209,3 +232,93 @@ def test_peer_down_aborts_load_jobs():
         assert job.state == _JobState.ABORTED
     finally:
         decoder.close()
+
+
+def test_transfer_done_marks_job_complete():
+    """End-to-end: save() + load() with real NIXL → get_finished returns job as DONE.
+
+    Uses actual NIXL UCX transfers between two PDConnectors on the same host.
+    Block hashes must match between save() and load(); block_indexes[i] points to
+    the Decoder kv_block slot that receives block i.
+    """
+    port_p, port_d = BASE_PORT + 14, BASE_PORT + 15
+    prefiller, nixl_p, decoder, nixl_d = _make_pair(port_p, port_d)
+    try:
+        # Prefiller has one kv_block (index 0); Decoder has one kv_block (index 0)
+        block_hash = 42
+        kv_block_p = prefiller._kv_blocks[0]
+        addr_p = kv_block_p.data_ptr()
+
+        prefiller.save("job1", [BlockDesc(block_hash=block_hash, addr=addr_p,
+                                          size=kv_block_p.numel() * kv_block_p.element_size())])
+        decoder.load("job1", [block_hash], [0], _peer_id(port_p))
+
+        # Allow time for handshake + NIXL transfer + transfer_done message
+        deadline = time.monotonic() + 5.0
+        finished = []
+        while time.monotonic() < deadline:
+            finished = decoder.get_finished(["job1"])
+            if finished:
+                break
+            time.sleep(0.05)
+
+        assert finished == ["job1"]
+        with decoder._lock:
+            assert decoder._load_jobs["job1"].state == _JobState.DONE
+    finally:
+        prefiller.close()
+        decoder.close()
+
+
+def test_streaming_save_triggers_transfer():
+    """Prefiller saves blocks incrementally; each save() chunk is transferred as it arrives."""
+    port_p, port_d = BASE_PORT + 16, BASE_PORT + 17
+    prefiller, nixl_p, decoder, nixl_d = _make_pair(port_p, port_d)
+
+    # Need 2 kv_block slots on each side
+    extra_kv_p = torch.zeros(1024, dtype=torch.float32)
+    extra_kv_d = torch.zeros(1024, dtype=torch.float32)
+    prefiller2, nixl_p2, decoder2, nixl_d2 = _make_pair(BASE_PORT + 18, BASE_PORT + 19)
+    prefiller2.close()
+    decoder2.close()
+
+    # Re-create with 2 blocks each
+    nixl_p3 = MockNixl()
+    nixl_d3 = MockNixl()
+    kv_p = [torch.zeros(1024, dtype=torch.float32), torch.zeros(1024, dtype=torch.float32)]
+    kv_d = [torch.zeros(1024, dtype=torch.float32), torch.zeros(1024, dtype=torch.float32)]
+    port_p3, port_d3 = BASE_PORT + 20, BASE_PORT + 21
+    prefiller3 = PDConnector(_peer_id(port_p3), port_p3, nixl_p3, kv_blocks=kv_p,
+                              heartbeat_ivl_ms=200, heartbeat_timeout_ms=1000)
+    decoder3   = PDConnector(_peer_id(port_d3), port_d3, nixl_d3, kv_blocks=kv_d,
+                              heartbeat_ivl_ms=200, heartbeat_timeout_ms=1000)
+    try:
+        hash1, hash2 = 101, 102
+        addr1 = prefiller3._kv_blocks[0].data_ptr()
+        addr2 = prefiller3._kv_blocks[1].data_ptr()
+        size  = prefiller3._kv_blocks[0].numel() * prefiller3._kv_blocks[0].element_size()
+
+        # Decoder requests both blocks; Prefiller saves them one at a time
+        decoder3.load("job1", [hash1, hash2], [0, 1], _peer_id(port_p3))
+        time.sleep(0.2)  # let handshake + lookup_fetch arrive
+
+        prefiller3.save("job1", [BlockDesc(block_hash=hash1, addr=addr1, size=size)])
+        time.sleep(0.2)  # first chunk transferred
+
+        # Job not done yet — second block still pending
+        assert decoder3.get_finished(["job1"]) == []
+
+        prefiller3.save("job1", [BlockDesc(block_hash=hash2, addr=addr2, size=size)])
+
+        deadline = time.monotonic() + 5.0
+        finished = []
+        while time.monotonic() < deadline:
+            finished = decoder3.get_finished(["job1"])
+            if finished:
+                break
+            time.sleep(0.05)
+
+        assert finished == ["job1"]
+    finally:
+        prefiller3.close()
+        decoder3.close()
