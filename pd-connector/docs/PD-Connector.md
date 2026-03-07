@@ -248,17 +248,6 @@ At `PDConnector.__init__()` time, after storing `self._kv_blocks`:
 2. Register all KV blocks: `self._reg = self._agent.register_memory(self._kv_blocks)`
 3. Prepare a local descriptor list: `self._local_dlist = self._agent.prep_xfer_dlist("NIXL_INIT_AGENT", self._kv_blocks)`
 
-At transfer time (implemented in a later step), the Prefiller initiates a WRITE by selecting block indices from the pre-prepared descriptor list:
-
-```
-handle = agent.make_prepped_xfer(
-    "WRITE",
-    self._local_dlist, local_indices,   # source: Prefiller's kv_blocks
-    remote_dlist,      remote_indices,  # destination: Decoder's kv_blocks (prep'd after metadata exchange)
-)
-agent.transfer(handle)
-```
-
 On `close()`, deregister memory and release the handle:
 ```
 self._agent.release_dlist_handle(self._local_dlist)
@@ -274,7 +263,6 @@ self._agent.deregister_memory(self._reg)
 | `__init__()` | `agent.prep_xfer_dlist("NIXL_INIT_AGENT", self._kv_blocks)` → `self._local_dlist` |
 | `close()` | `agent.release_dlist_handle(self._local_dlist)` |
 | `close()` | `agent.deregister_memory(self._reg)` |
-| Transfer (later step) | `agent.make_prepped_xfer("WRITE", local_dlist, local_indices, remote_dlist, remote_indices)` |
 
 #### Tasks
 - [ ] Create `nixl_agent` in `PDConnector.__init__()` with UCX backend; store as `self._agent`
