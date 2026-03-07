@@ -2,13 +2,13 @@
 
 ## Abstract
 
-In this design PD disaggregation is based on the vLLM CPU KV cache which is per vLLM instance and it is in canonical layout (single TP unified block size). The PD Connector is a secondary pillar that is registered as such. Orchestration with the CPU cache is done via the PrimaryPillar and it not known to the secondar pillars.
+In this design PD disaggregation is based on the vLLM CPU KV cache which is per vLLM instance and it is in canonical layout (single TP unified block size). The PD Connector is a secondary tier that is registered as such. Orchestration with the CPU cache is done via the PrimaryTier and it not known to the secondary tiers.
 
 ## Assumptions
 
 - Decoder can be known or unknown to Prefiller when a request is submitted to the Prefiller (Deffered decode)
-- A request can be submitted to the Decoder before Prefiller has completed the request
-- Translating canonical layout to per GPU worker layout is done in the worker context (Secondary pillars are agnostic to that)
+- A request can be submitted to the Decoder without any dependency on submitting the request to the prefiller
+- Translating canonical layout to per GPU worker layout is done in the worker context (Secondary tiers are agnostic to that)
 - A store operation to the CPU KV cache can fail only by:
   - Allocation failure
   - Prefiller crash
@@ -18,7 +18,7 @@ In this design PD disaggregation is based on the vLLM CPU KV cache which is per 
 - Each Prefill node can service pull requests from any other node in the cluster
 - Crash of Prefiller or Decoder should be handled gracefully without any resource leaks
 - Support general P2P sharing pro-active and reactive
-- Security? Does Prefiller or Decoder should accept transfer requests without any authentication?
+- Security?
 - Different block size across nodes in the cluster?
 - Performance of TTFT and Tok/Sec should be similar to the existing NixlConnector
 
@@ -28,18 +28,19 @@ In this design PD disaggregation is based on the vLLM CPU KV cache which is per 
 
 #### Components
 
-- **PrimaryPillar** — The main component that drives the KV cache lifecycle. It interacts with the OffloadingManager to offload GPU memory to CPU and triggers secondary pillars accordingly.
+- **OffloadingManager (CPU KV Cache)** — Manages the CPU KV cache per vLLM instance in canonical layout.
 
-- **SecondaryPillar** — A pluggable component registered with the OffloadingManager that implements the actual KV cache transfer between nodes. The PD Connector is implemented as a secondary pillar, handling load and store between peers.
+- **PrimaryTier** — The main component that drives the KV cache lifecycle. It interacts with the OffloadingManager to offload GPU memory to CPU and triggers secondary tiers accordingly.
+
+- **SecondaryTier** — A pluggable component registered with the OffloadingManager that implements the actual KV cache transfer between nodes. The PD Connector is implemented as a secondary tier, handling load and store between peers.
 
 #### Component Diagram
 
 ```mermaid
 graph TD
-    PP[PrimaryPillar] -->|schedule load/store| OM["OffloadingManager<br/>CPU KV Cache"]
-    PP -->|load/save| SP["SecondaryPillar<br/>PD Connector"]
-    SP -->|prepare load| OM
-    SP -->|prepare save| OM
+    PP[PrimaryTier] -->|schedule load/store| OM["OffloadingManager<br/>CPU KV Cache"]
+    PP -->|load/save| SP["SecondaryTier<br/>PD Connector"]
+    PP -->|get_required_blocks| SP
     SP -->|CTRL:lookup_fetch| Remote[Remote Peer PD]
     SP -->|NIXL.Transfer| Remote
 ```
@@ -51,12 +52,13 @@ graph TD
     - When do we know for sure that blocks have been saved already
   - **Option 2** - Control message that will prepare the data operation and then trigger one-sided transfer.
 - Allow streaming of saved KV blocks on the prefiller side to the Decoder.
+  Implemented by allowing to submit the request to the decoder at once before KV blocks are computed on the Prefiller. This allows the prefiller to send KV blocks once they are in the CPU cache after receiving an allocate_fetch() control command from the decoder.
 ### API
 
-#### Secondary Pillar
-- `register_secondary_pilar()`
+#### Secondary Tier
+- `register_secondary_tier()`
 - `load(job_id, block_hashs, peer_id)` — Decoder initiates a load from Prefiller
-- `get_required_blocks()` - Polled by the primary pillar
+- `get_required_blocks()` - Polled by the primary tier
 - `save(job_id, block_descs)` — Prefiller saves blocks
 - `get_finished()` — Async notification of load/save operation completion
 
@@ -66,38 +68,29 @@ graph TD
 
 ```mermaid
 sequenceDiagram
-    participant Prefiller_OC as Prefiller OC
-    participant Prefiller_CPU_Cache as Prefiller CPU Cache
-    participant Prefiller_PD as Prefiller PD
-    participant Decoder_PD as Decoder PD
-    participant Decoder_CPU_Cache as Decoder CPU Cache
-    participant Decoder_OC as Decoder OC
+    participant Prefiller_OC as Prefiller PrimaryTier
+    participant Prefiller_PD as Prefiller SecondaryTier PD
+    participant Decoder_PD as Decoder SecondaryTier PD
+    participant Decoder_OC as Decoder PrimaryTier
 
     Prefiller_PD->>Prefiller_PD: Open listener thread
     Decoder_PD->>Decoder_PD: Open listener thread
 
     Note over Prefiller_OC,Decoder_OC: ── Init time ──
 
-    Prefiller_OC->>Prefiller_PD: save(job_id, block_descs)
-
-    Note over Prefiller_OC: Poll until get_finshed(job_id) returns completed
-
     Decoder_OC->>Decoder_PD: load(job_id, block_hashs, peer_id)
     Note right of Prefiller_PD: If no connection to D exists,<br/>do handshake and create connection
 
-    Decoder_PD->>Decoder_CPU_Cache: prepare_save(block_hashs)
-
     Decoder_PD->>Prefiller_PD: 𝗖𝗧𝗥𝗟:lookup_fetch(job_id, block_hashs, local_block_descs)
 
-    Prefiller_PD->>Prefiller_CPU_Cache: prepare_load(block_hashs)
+    Prefiller_OC->>Prefiller_PD: get_required_blocks()
+    Note left of Prefiller_OC: Iterate over chunks till completion
+    Prefiller_OC->>Prefiller_PD: save(job_id, block_descs)
 
     Prefiller_PD-)Decoder_PD: 𝗗𝗔𝗧𝗔:NIXL.Transfer(WRITE, local_block_descs, remote_block_descs)
 
     Prefiller_PD-->>Decoder_PD: Transfer complete
     Prefiller_PD-->>Prefiller_PD: Transfer complete
-    Prefiller_PD->>Prefiller_CPU_Cache: complete_load(block_hashs)
-    Decoder_PD->>Decoder_CPU_Cache: complete_save(block_hashs)
-
 
     Decoder_OC->>Decoder_PD: get_finished(job_id)
     Prefiller_OC->>Prefiller_PD: get_finished(job_id)
@@ -105,48 +98,49 @@ sequenceDiagram
 ```
 ### Error Handling
 #### Allocation Failure on Prefiller Side (valid only when a request is sent to the Decoder before the Prefiller completes it)
-TBD
+Temporary solution is based on timeout after lookup_fetch().
+An abort request API can be considered that should be passed by the orchestrator layer.
 #### vLLM Crash
 - A lost control connection between the Prefiller and the Decoder should trigger an abort of all ongoing requests.
 #### Submit lookup_fetch() before a request is submitted to the Prefiller
-- Timeout TBD
+- lookup_fetch() should be constricted by a timeout to catch such a case.
 
 ## Implementation
 
-### Step 1: SecondaryPillars
+### Step 1: SecondaryTiers
 
-Introduce a `SecondaryPillar` base class and a `SecondaryPillars` registry component. `PrimaryPillar` depends on `SecondaryPillars` to dispatch operations. Individual `SecondaryPillar` implementations register themselves into `SecondaryPillars` without any knowledge of `PrimaryPillar`.
+Introduce a `SecondaryTier` base class and a `SecondaryTiers` registry component. `PrimaryTier` depends on `SecondaryTiers` to dispatch operations. Individual `SecondaryTier` implementations register themselves into `SecondaryTiers` without any knowledge of `PrimaryTier`.
 
 ```
-PrimaryPillar --> SecondaryPillars --> [SecondaryPillar, SecondaryPillar, ...]
+PrimaryTier --> SecondaryTiers --> [SecondaryTier, SecondaryTier, ...]
 ```
 
 #### Tasks
-- [ ] Define `SecondaryPillar` abstract base class with `load`, `save`, `get_finished` methods
-- [ ] Implement `SecondaryPillars` registry with `register(pillar: SecondaryPillar)` and dispatch methods
-- [ ] `PrimaryPillar` holds a reference to `SecondaryPillars` and calls it on `load`/`save`
-- [ ] `SecondaryPillars` iterates registered pillars and calls each in sequence
+- [ ] Define `SecondaryTier` abstract base class with `load`, `save`, `get_finished` methods
+- [ ] Implement `SecondaryTiers` registry with `register(tier: SecondaryTier)` and dispatch methods
+- [ ] `PrimaryTier` holds a reference to `SecondaryTiers` and calls it on `load`/`save`
+- [ ] `SecondaryTiers` iterates registered tiers and calls each in sequence
 - [ ] Add unit tests for registration and sequential dispatch
 
 #### Tests
 
-Tests are located in `tests/test_secondary_pillars.py`.
+Tests are located in `tests/test_secondary_tiers.py`.
 
 To run:
 ```bash
 cd /home/lirans/my-utils/pd-connector
-python3 -m pytest tests/test_secondary_pillars.py -v
+python3 -m pytest tests/test_secondary_tiers.py -v
 ```
 
-### Step 2: PDConnector as a SecondaryPillar
+### Step 2: PDConnector as a SecondaryTier
 
-Implement `PDConnector` as a concrete `SecondaryPillar`. It handles the actual KV cache transfer between Prefiller and Decoder nodes using NIXL.
+Implement `PDConnector` as a concrete `SecondaryTier`. It handles the actual KV cache transfer between Prefiller and Decoder nodes using NIXL.
 
-On the **Prefiller side**, `save()` stores KV block descriptors and waits for incoming `lookup_fetch` requests from the Decoder.
+On the **Prefiller side**, the PrimaryTier polls `get_required_blocks()` to determine which blocks the SecondaryTier needs, then calls `save()` to store KV block descriptors. The SecondaryTier waits for incoming `lookup_fetch` requests from the Decoder and initiates the transfer once blocks are available.
 On the **Decoder side**, `load()` connects to the Prefiller peer, sends a `lookup_fetch` control message, and triggers a NIXL transfer to save the blocks into the local CPU cache.
 
 #### Tasks
-- [ ] Implement `PDConnector(SecondaryPillar)` class in `src/pd_connector.py`
+- [ ] Implement `PDConnector(SecondaryTier)` class in `src/pd_connector.py`
 - [ ] `save(job_id, block_descs)` — register block descriptors, ready to serve `lookup_fetch`
 - [ ] `load(job_id, block_hashes, peer_id)` — connect to peer, send `CTRL:lookup_fetch`, trigger NIXL transfer
 - [ ] `get_finished(job_ids)` — poll NIXL transfer status and return completed job ids
@@ -182,12 +176,28 @@ Peer C (DEALER) ──┘         │
 - **Message format**: MessagePack (msgspec) — consistent with the existing NIXL handshake wire format.
 - **Graceful disconnect**: a `{"type": "disconnect", "peer_id": "..."}` message triggers immediate `on_peer_down` without waiting for timeout.
 
+#### Keep-Alive Mechanism
+
+Liveness is implemented using **ZMQ's built-in ZMTP heartbeat** — no application-level ping thread is needed. Both the ROUTER and each DEALER socket have the following socket options set at creation time:
+
+| Option | Default | Description |
+|---|---|---|
+| `HEARTBEAT_IVL` | 2000 ms | How often ZMQ sends a PING to the peer |
+| `HEARTBEAT_TIMEOUT` | 10000 ms | How long ZMQ waits for a PONG before closing the connection |
+| `HEARTBEAT_TTL` | 10000 ms | How long the remote peer considers this side alive without a PING |
+
+When ZMQ detects a dead connection (no PONG within `HEARTBEAT_TIMEOUT`), it closes the DEALER socket and fires `EVENT_DISCONNECTED` on that socket's monitor. A dedicated `_monitor_loop` background thread polls all DEALER monitor sockets using a ZMQ `Poller` and calls `on_peer_down(peer_id)` when `EVENT_DISCONNECTED` is received.
+
+- **Startup**: heartbeats are activated automatically as soon as the socket is connected. No application-level handshake is required.
+- **Shutdown**: on clean disconnect, `disconnect()` sends a `{"type": "disconnect"}` application message so the remote `_listener_loop` fires `on_peer_down` immediately without waiting for the heartbeat timeout to expire.
+
 #### Tasks
 - [ ] Implement `ZmqCtrlTransport(CtrlTransport)` in `src/zmq_ctrl_transport.py`
 - [ ] Listener thread: ZMQ `ROUTER` socket, receives from any peer, dispatches to `recv()` queue
 - [ ] Sender: ZMQ `DEALER` socket per peer (lazily created), sends messages to a specific peer
 - [ ] Heartbeat sender: background thread sends heartbeat to each connected peer at `heartbeat_interval_s`
 - [ ] Heartbeat monitor: background thread checks `last_seen` and calls `on_peer_down(peer_id)` on timeout
+- [ ] Send `disconnect` message on `close()` before tearing down sockets
 - [ ] Register `on_peer_down` callback in `PDConnector` to cancel in-progress jobs for the failed peer
 - [ ] Add unit tests in `tests/test_zmq_ctrl_transport.py`
 
