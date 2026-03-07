@@ -234,37 +234,129 @@ cd /home/lirans/my-utils/pd-connector
 python3 -m pytest tests/test_pd_connector.py -v
 ```
 
-### Step 5: NIXL Transfer
+### Step 5: NIXL Registration and Prepped Descriptor List
 
-Replace the `NixlTransport` abstraction with a direct `nixl_agent` implementation inside `PDConnector`. No wrapper class — NIXL calls are made inline.
+Create a `nixl_agent` inside `PDConnector` and register the CPU KV block tensors with NIXL at init time. Immediately prepare a local descriptor list handle (`nixl_prepped_dlist_handle`) from the registered memory so that future transfers can be initiated using only block indices — avoiding repeated descriptor preparation per transfer.
+
+No metadata exchange with remote peers is performed in this step.
+
+#### Design
+
+At `PDConnector.__init__()` time, after storing `self._kv_blocks`:
+
+1. Create `self._agent = nixl_agent(peer_id, nixl_agent_config(backends=["UCX"]))`
+2. Register all KV blocks: `self._reg = self._agent.register_memory(self._kv_blocks)`
+3. Prepare a local descriptor list: `self._local_dlist = self._agent.prep_xfer_dlist("NIXL_INIT_AGENT", self._kv_blocks)`
+
+At transfer time (implemented in a later step), the Prefiller initiates a WRITE by selecting block indices from the pre-prepared descriptor list:
+
+```
+handle = agent.make_prepped_xfer(
+    "WRITE",
+    self._local_dlist, local_indices,   # source: Prefiller's kv_blocks
+    remote_dlist,      remote_indices,  # destination: Decoder's kv_blocks (prep'd after metadata exchange)
+)
+agent.transfer(handle)
+```
+
+On `close()`, deregister memory and release the handle:
+```
+self._agent.release_dlist_handle(self._local_dlist)
+self._agent.deregister_memory(self._reg)
+```
 
 #### NIXL API mapping
 
 | PDConnector action | NIXL call |
 |---|---|
-| Startup | `nixl_agent(peer_id, nixl_agent_config())` |
-| `save()` | `agent.register_memory(block_descs, mem_type="DRAM")` |
-| `connect()` | exchange `agent_metadata` over ZMQ ctrl channel → `agent.add_remote_agent(remote_metadata)` |
-| `_handle_lookup_fetch()` | `agent.get_xfer_descs(local_descs)` + `agent.initialize_xfer("WRITE", ...)` + `agent.transfer(handle)` |
-| `get_finished()` | `agent.check_xfer_state(handle)` == `"DONE"` for each active handle |
-| `save()` complete | `agent.deregister_memory(reg_list)` |
-
-#### Metadata exchange
-
-NIXL requires both peers to have each other's agent metadata before a transfer can start. The metadata is exchanged over the existing ZMQ ctrl channel using a new message type:
-
-```
-Decoder → Prefiller:  {"type": "agent_metadata", "peer_id": "...", "metadata": <bytes>}
-Prefiller → Decoder:  {"type": "agent_metadata", "peer_id": "...", "metadata": <bytes>}
-```
-
-`PDConnector.connect()` sends local metadata immediately after the ZMQ connection is established. The listener thread handles incoming `agent_metadata` messages by calling `agent.add_remote_agent()`.
+| `__init__()` | `nixl_agent(peer_id, nixl_agent_config(backends=["UCX"]))` |
+| `__init__()` | `agent.register_memory(self._kv_blocks)` → `self._reg` |
+| `__init__()` | `agent.prep_xfer_dlist("NIXL_INIT_AGENT", self._kv_blocks)` → `self._local_dlist` |
+| `close()` | `agent.release_dlist_handle(self._local_dlist)` |
+| `close()` | `agent.deregister_memory(self._reg)` |
+| Transfer (later step) | `agent.make_prepped_xfer("WRITE", local_dlist, local_indices, remote_dlist, remote_indices)` |
 
 #### Tasks
-- [ ] Create `nixl_agent` in `PDConnector.__init__()` with UCX backend
-- [ ] In `save()`, register block memory with NIXL and store `nixlRegDList` per job
-- [ ] In `connect()`, send local `agent_metadata` over ZMQ ctrl channel
-- [ ] In `_listen()`, handle `agent_metadata` message → call `agent.add_remote_agent()`
-- [ ] In `_handle_lookup_fetch()`, call `initialize_xfer("WRITE", ...)` + `transfer()`, store handle keyed by transfer_id
-- [ ] In `get_finished()`, call `check_xfer_state()` per active handle; on `"DONE"` release handle and deregister memory
-- [ ] Add integration test with two real PDConnector instances and CPU DRAM buffers
+- [ ] Create `nixl_agent` in `PDConnector.__init__()` with UCX backend; store as `self._agent`
+- [ ] Call `self._agent.register_memory(self._kv_blocks)` and store result as `self._reg`
+- [ ] Call `self._agent.prep_xfer_dlist("NIXL_INIT_AGENT", self._kv_blocks)` and store as `self._local_dlist`
+- [ ] On `close()`, call `self._agent.release_dlist_handle(self._local_dlist)` then `self._agent.deregister_memory(self._reg)`
+- [ ] Add unit test verifying `self._reg` and `self._local_dlist` are set after init
+- [ ] Add unit test verifying deregistration is called on `close()`
+
+### Step 6: Connection Establishment
+
+When `load()` is called for a peer not yet connected, establish a ZMQ control channel connection and exchange NIXL agent metadata and block descriptors. This gives the Prefiller everything it needs to prep a remote descriptor list (`remote_dlist`) for the Decoder's KV blocks so that `make_prepped_xfer` can be called using only indices.
+
+#### peer_id format
+
+`peer_id` encodes the remote ZMQ listener address as `"<host>:<port>"`. `load()` parses it to drive `_ctrl.connect()`.
+
+#### Handshake
+
+```
+Decoder ──connect msg──► Prefiller
+         {type: "connect",
+          peer_id: decoder_id,
+          agent_metadata: <bytes>,   # Decoder's NIXL metadata
+          block_descs: [[addr,len,dev_id], ...]}  # Decoder's kv_blocks as Nx3 array
+
+Decoder ◄──connect_ack── Prefiller
+         {type: "connect_ack",
+          peer_id: prefiller_id,
+          agent_metadata: <bytes>}   # Prefiller's NIXL metadata
+```
+
+The Decoder blocks in `_connect()` until the `connect_ack` arrives (per-peer `threading.Event`, with timeout).
+
+#### State added
+
+| Field | Type | Description |
+|---|---|---|
+| `_connections` | `set[str]` | peer_ids with a completed handshake |
+| `_connect_events` | `dict[str, Event]` | one Event per in-progress connect |
+| `_remote_dlists` | `dict[str, nixl_prepped_dlist_handle]` | Prefiller's prepped dlist per Decoder peer |
+
+#### Flow
+
+**Decoder side** (`load()` → `_connect(peer_id)`):
+1. Parse `host, port = peer_id.rsplit(":", 1)`
+2. `self._ctrl.connect(peer_id, host, int(port))`
+3. Send `connect` message with `self._agent.get_agent_metadata()` and `self._agent.get_xfer_descs(self._kv_blocks)` serialised as an Nx3 array
+4. Wait on `self._connect_events[peer_id]` (timeout = 10 s)
+5. Mark `peer_id` in `self._connections`
+
+**Prefiller side** (listener handles `connect`):
+1. `self._agent.add_remote_agent(msg["agent_metadata"])`
+2. `self._remote_dlists[sender_id] = self._agent.prep_xfer_dlist(sender_id, msg["block_descs"])`
+3. Mark `sender_id` in `self._connections`
+4. Reply with `connect_ack` carrying `self._agent.get_agent_metadata()`
+
+**Decoder side** (listener handles `connect_ack`):
+1. `self._agent.add_remote_agent(msg["agent_metadata"])`
+2. Set `self._connect_events[sender_id]`
+
+#### On peer down
+
+`_on_peer_down()` removes the peer from `_connections` and releases its entry in `_remote_dlists`.
+
+#### Tasks
+- [ ] Change `peer_id` contract: format `"<host>:<port>"`; parse in `_connect()`
+- [ ] Add `_connections: set[str]`, `_connect_events: dict[str, threading.Event]`, `_remote_dlists: dict[str, nixl_prepped_dlist_handle]`
+- [ ] `load()`: if `peer_id` not in `_connections`, call `_connect(peer_id)` before sending `lookup_fetch`
+- [ ] Implement `_connect(peer_id)`: parse host/port, ZMQ connect, send `connect` message, wait on event
+- [ ] Listener handles `connect`: `add_remote_agent`, `prep_xfer_dlist` → `_remote_dlists`, send `connect_ack`
+- [ ] Listener handles `connect_ack`: `add_remote_agent`, set event
+- [ ] `_on_peer_down()`: clear `_connections` entry, release and remove `_remote_dlists` entry
+- [ ] `close()`: release all `_remote_dlists` handles
+- [ ] Add integration test: two connectors, `load()` triggers handshake, verify both sides have `_connections` populated and Prefiller has `_remote_dlists` entry
+
+#### Tests
+
+Tests are located in `tests/test_pd_connector.py`.
+
+To run:
+```bash
+cd /home/lirans/my-utils/pd-connector
+python3 -m pytest tests/test_pd_connector.py -v
+```

@@ -15,6 +15,8 @@ from dataclasses import dataclass, field
 from enum import Enum, auto
 import torch
 
+from nixl._api import nixl_agent, nixl_agent_config
+
 from src.secondary_pillar import BlockDesc, SecondaryPillar
 from src.zmq_ctrl_transport import ZmqCtrlTransport
 
@@ -82,7 +84,7 @@ class PDConnector(SecondaryPillar):
         self,
         peer_id: str,
         listen_port: int,
-        nixl: NixlTransport,
+        nixl: NixlTransport,  # TODO: remove once all methods use self._agent directly
         kv_blocks: list[torch.Tensor] | None = None,
         heartbeat_ivl_ms:     int = 2000,
         heartbeat_timeout_ms: int = 10000,
@@ -90,6 +92,16 @@ class PDConnector(SecondaryPillar):
         self._peer_id  = peer_id
         self._nixl     = nixl
         self._kv_blocks: list[torch.Tensor] = kv_blocks if kv_blocks is not None else []
+
+        # NIXL agent — register all KV blocks up front and prep a local descriptor list
+        # so future transfers can be initiated using only block indices.
+        self._agent = nixl_agent(peer_id, nixl_agent_config(backends=["UCX"]))
+        if self._kv_blocks:
+            self._reg        = self._agent.register_memory(self._kv_blocks)
+            self._local_dlist = self._agent.prep_xfer_dlist("NIXL_INIT_AGENT", self._kv_blocks)
+        else:
+            self._reg         = None
+            self._local_dlist = None
 
         self._lock             = threading.Lock()
         self._save_jobs:       dict[str, _SaveJob] = {}
@@ -119,6 +131,10 @@ class PDConnector(SecondaryPillar):
 
     def close(self) -> None:
         self._ctrl.close()
+        if self._local_dlist is not None:
+            self._agent.release_dlist_handle(self._local_dlist)
+        if self._reg is not None:
+            self._agent.deregister_memory(self._reg)
 
     # ------------------------------------------------------------------
     # SecondaryPillar interface

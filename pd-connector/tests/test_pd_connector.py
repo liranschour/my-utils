@@ -61,6 +61,27 @@ def test_kv_blocks_defaults_to_empty():
         connector.close()
 
 
+def test_nixl_registration_at_init():
+    blocks = [torch.zeros(1024, dtype=torch.float32) for _ in range(2)]
+    nixl = MockNixl()
+    connector = PDConnector("regnode", BASE_PORT - 4, nixl, kv_blocks=blocks)
+    try:
+        assert connector._reg is not None
+        assert connector._local_dlist is not None
+    finally:
+        connector.close()
+
+
+def test_nixl_registration_skipped_when_no_blocks():
+    nixl = MockNixl()
+    connector = PDConnector("regnode2", BASE_PORT - 3, nixl)
+    try:
+        assert connector._reg is None
+        assert connector._local_dlist is None
+    finally:
+        connector.close()
+
+
 def test_save_registers_job():
     prefiller, nixl_p, decoder, nixl_d = _make_pair(BASE_PORT, BASE_PORT + 1)
     try:
