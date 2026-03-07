@@ -13,8 +13,12 @@ class BlockDesc:
 class SecondaryPillar(ABC):
 
     @abstractmethod
-    def load(self, job_id: str, block_hashes: list[int], peer_id: str) -> None:
-        """Decoder: initiate load of KV blocks from a remote Prefiller peer."""
+    def load(self, job_id: str, block_hashes: list[int], block_indexes: list[int], peer_id: str) -> None:
+        """Decoder: initiate load of KV blocks from a remote Prefiller peer.
+
+        block_hashes[i] identifies the block; block_indexes[i] is the local kv_block
+        slot (index into the descriptors registered at init) where it should be written.
+        """
         ...
 
     @abstractmethod
@@ -42,9 +46,9 @@ class SecondaryPillars:
     def register(self, pillar: SecondaryPillar) -> None:
         self._pillars.append(pillar)
 
-    def load(self, job_id: str, block_hashes: list[int], peer_id: str) -> None:
+    def load(self, job_id: str, block_hashes: list[int], block_indexes: list[int], peer_id: str) -> None:
         for pillar in self._pillars:
-            pillar.load(job_id, block_hashes, peer_id)
+            pillar.load(job_id, block_hashes, block_indexes, peer_id)
 
     def save(self, job_id: str, block_descs: list[BlockDesc]) -> None:
         for pillar in self._pillars:

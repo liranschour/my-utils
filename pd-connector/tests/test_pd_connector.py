@@ -102,7 +102,7 @@ def test_load_ack_advances_to_transfer_state():
     prefiller, nixl_p, decoder, nixl_d = _make_pair(port_p, port_d)
     try:
         prefiller.save("job1", [BlockDesc(block_hash=1, addr=0x1000, size=4096)])
-        decoder.load("job1", [1], _peer_id(port_p))
+        decoder.load("job1", [1], [0], _peer_id(port_p))
 
         # Job starts in PENDING (waiting for ack)
         with decoder._lock:
@@ -126,7 +126,7 @@ def test_load_control_failure_no_save():
     prefiller, nixl_p, decoder, nixl_d = _make_pair(port_p, port_d)
     try:
         decoder._LOOKUP_ACK_TIMEOUT_S = 0.3
-        decoder.load("job1", [1], _peer_id(port_p))  # no prefiller.save()
+        decoder.load("job1", [1], [0], _peer_id(port_p))  # no prefiller.save()
 
         time.sleep(0.6)
 
@@ -145,7 +145,7 @@ def test_load_transfer_failure_after_ack():
     try:
         prefiller.save("job1", [BlockDesc(block_hash=1, addr=0x1000, size=4096)])
         decoder._TRANSFER_TIMEOUT_S = 0.3
-        decoder.load("job1", [1], _peer_id(port_p))
+        decoder.load("job1", [1], [0], _peer_id(port_p))
 
         # Wait for ack then for xfer deadline to pass
         time.sleep(0.8)
@@ -163,7 +163,7 @@ def test_abort_prevents_job_completion():
     prefiller, nixl_p, decoder, nixl_d = _make_pair(port_p, port_d)
     try:
         prefiller.save("job1", [BlockDesc(block_hash=1, addr=0x1000, size=4096)])
-        decoder.load("job1", [1], _peer_id(port_p))
+        decoder.load("job1", [1], [0], _peer_id(port_p))
 
         decoder.abort("job1")
 
@@ -181,7 +181,7 @@ def test_load_auto_connects_and_handshakes():
     prefiller, nixl_p, decoder, nixl_d = _make_pair(port_p, port_d)
     try:
         prefiller.save("job1", [BlockDesc(block_hash=1, addr=0x1000, size=4096)])
-        decoder.load("job1", [1], _peer_id(port_p))  # triggers auto-connect + handshake
+        decoder.load("job1", [1], [0], _peer_id(port_p))  # triggers auto-connect + handshake
         time.sleep(0.3)
 
         assert _peer_id(port_p) in decoder._connections
@@ -196,7 +196,7 @@ def test_peer_down_aborts_load_jobs():
     port_p, port_d = BASE_PORT + 12, BASE_PORT + 13
     prefiller, nixl_p, decoder, nixl_d = _make_pair(port_p, port_d)
     try:
-        decoder.load("job1", [1], _peer_id(port_p))
+        decoder.load("job1", [1], [0], _peer_id(port_p))
         time.sleep(0.3)
 
         # Simulate prefiller going down — decoder's on_peer_down fires

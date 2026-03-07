@@ -70,6 +70,7 @@ class _SaveJob:
 class _LoadJob:
     job_id: str
     block_hashes: list[int]
+    block_indexes: list[int]    # Decoder's kv_block slot for each hash (same order)
     peer_id: str
     ack_deadline: float = 0.0   # exceeded with no ack → control failure
     xfer_deadline: float = 0.0  # set on ack; exceeded → transfer failure
@@ -162,10 +163,12 @@ class PDConnector(SecondaryPillar):
         with self._lock:
             self._save_jobs[job_id] = _SaveJob(job_id, block_descs)
 
-    def load(self, job_id: str, block_hashes: list[int], peer_id: str) -> None:
+    def load(self, job_id: str, block_hashes: list[int], block_indexes: list[int], peer_id: str) -> None:
         """Decoder: connect to Prefiller if needed, then send lookup_fetch.
 
         peer_id must be in "host:port" format pointing to the remote ZMQ listener.
+        block_hashes[i] identifies block i; block_indexes[i] is the local kv_block
+        slot where the Prefiller should write it.
         Raises TimeoutError if the connection handshake fails.
         """
         self._ensure_connected(peer_id)
@@ -173,6 +176,7 @@ class PDConnector(SecondaryPillar):
         job = _LoadJob(
             job_id=job_id,
             block_hashes=block_hashes,
+            block_indexes=block_indexes,
             peer_id=peer_id,
             ack_deadline=time.monotonic() + self._LOOKUP_ACK_TIMEOUT_S,
         )
@@ -180,10 +184,11 @@ class PDConnector(SecondaryPillar):
             self._load_jobs[job_id] = job
 
         self._ctrl.send(peer_id, {
-            "type":         "lookup_fetch",
-            "job_id":       job_id,
-            "block_hashes": block_hashes,
-            "peer_id":      self._peer_id,
+            "type":          "lookup_fetch",
+            "job_id":        job_id,
+            "block_hashes":  block_hashes,
+            "block_indexes": block_indexes,
+            "peer_id":       self._peer_id,
         })
 
     def get_finished(self, job_ids: list[str]) -> list[str]:
