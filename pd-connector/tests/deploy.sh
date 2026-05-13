@@ -1,0 +1,338 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+#
+# Deploy a PD-disaggregated vLLM environment (PDConnector or NixlConnector)
+# on OC pod(s). Supports single-pod (multiple GPUs) and multi-pod topologies.
+#
+# Usage:
+#   bash deploy.sh --config configs/cluster_pd.env
+#   bash deploy.sh --config configs/cluster_nixl.env
+#   LOG_LEVEL=DEBUG bash deploy.sh --config configs/cluster_pd.env
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
+
+# ---------------------------------------------------------------------------
+# Parse --config
+# ---------------------------------------------------------------------------
+CONFIG_FILE=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --config) CONFIG_FILE="$2"; shift 2 ;;
+        *) echo "Unknown argument: $1" >&2; exit 1 ;;
+    esac
+done
+
+if [[ -z "$CONFIG_FILE" ]]; then
+    echo "Usage: bash deploy.sh --config <config_file>" >&2
+    echo "Example configs: configs/cluster_pd.env  configs/cluster_nixl.env" >&2
+    exit 1
+fi
+
+# Source config file — but env vars already set in the caller's environment
+# take precedence (e.g. LOG_LEVEL=DEBUG bash deploy.sh overrides config).
+# Strategy: only set a variable from the config if it is not already exported.
+while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ "$line" =~ ^[[:space:]]*# ]] && continue          # skip comments
+    [[ -z "${line//[[:space:]]/}" ]] && continue          # skip blank lines
+    if [[ "$line" =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; then
+        _key="${BASH_REMATCH[1]}"
+        _val="${BASH_REMATCH[2]}"
+        # Only apply if the variable is not already set in the environment
+        [[ -z "${!_key+x}" ]] && export "${_key}=${_val}"
+    fi
+done < "$CONFIG_FILE"
+
+# ---------------------------------------------------------------------------
+# Defaults (config file already set these; shell env overrides both)
+# ---------------------------------------------------------------------------
+CONNECTOR="${CONNECTOR:-pd_connector}"
+PREFILLER_POD="${PREFILLER_POD:-llmd-transport-decoder}"
+DECODER_POD="${DECODER_POD:-llmd-transport-decoder}"
+PROXY_POD="${PROXY_POD:-${DECODER_POD}}"
+PREFILLER_GPUS="${PREFILLER_GPUS:-0}"
+DECODER_GPUS="${DECODER_GPUS:-1}"
+
+MODEL="${MODEL:-Qwen/Qwen3-8B}"
+GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.90}"
+MAX_MODEL_LEN="${MAX_MODEL_LEN:-8192}"
+BLOCK_SIZE="${BLOCK_SIZE:-16}"
+CPU_BYTES="${CPU_BYTES:-4294967296}"
+DECODER_FIRST="${DECODER_FIRST:-false}"
+
+VLLM_BIN="${VLLM_BIN:-/workspace/venv/bin/vllm}"
+PYTHON_BIN="${PYTHON_BIN:-/workspace/venv/bin/python}"
+
+LOG_LEVEL="${LOG_LEVEL:-INFO}"
+HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-600}"
+
+PREFILLER_HTTP_PORT="${PREFILLER_HTTP_PORT:-8100}"
+DECODER_HTTP_PORT="${DECODER_HTTP_PORT:-8200}"
+PROXY_PORT="${PROXY_PORT:-8192}"
+PREFILLER_PD_PORT="${PREFILLER_PD_PORT:-7777}"
+DECODER_PD_PORT="${DECODER_PD_PORT:-7778}"
+NIXL_SIDE_CHANNEL_PORT_PREFILLER="${NIXL_SIDE_CHANNEL_PORT_PREFILLER:-5559}"
+NIXL_SIDE_CHANNEL_PORT_DECODER="${NIXL_SIDE_CHANNEL_PORT_DECODER:-5659}"
+
+PREFILLER_LOG="${PREFILLER_LOG:-/tmp/prefiller.log}"
+DECODER_LOG="${DECODER_LOG:-/tmp/decoder.log}"
+PROXY_LOG="${PROXY_LOG:-/tmp/proxy.log}"
+STATE_FILE="${STATE_FILE:-/tmp/deploy_state.env}"
+
+# ---------------------------------------------------------------------------
+# Topology detection
+# ---------------------------------------------------------------------------
+if [[ "$PREFILLER_POD" == "$DECODER_POD" ]]; then
+    SINGLE_POD=true
+else
+    SINGLE_POD=false
+fi
+
+echo "=== Deploy: ${CONNECTOR} ==="
+echo "  Prefiller: pod=${PREFILLER_POD} gpus=${PREFILLER_GPUS} http=:${PREFILLER_HTTP_PORT}"
+echo "  Decoder:   pod=${DECODER_POD} gpus=${DECODER_GPUS} http=:${DECODER_HTTP_PORT}"
+echo "  Proxy:     pod=${PROXY_POD} http=:${PROXY_PORT}"
+echo "  Model:     ${MODEL}  gpu_mem=${GPU_MEM_UTIL}  max_len=${MAX_MODEL_LEN}"
+echo "  Single-pod: ${SINGLE_POD}"
+echo ""
+
+# ---------------------------------------------------------------------------
+# Resolve addresses
+# In single-pod mode services talk over localhost; multi-pod uses pod IPs.
+# ---------------------------------------------------------------------------
+get_pod_ip() {
+    oc get pod "$1" -o jsonpath='{.status.podIP}'
+}
+
+if $SINGLE_POD; then
+    PREFILLER_ADDR="127.0.0.1"
+    DECODER_ADDR="127.0.0.1"
+else
+    PREFILLER_ADDR="$(get_pod_ip "${PREFILLER_POD}")"
+    DECODER_ADDR="$(get_pod_ip "${DECODER_POD}")"
+    echo "  Prefiller IP: ${PREFILLER_ADDR}"
+    echo "  Decoder IP:   ${DECODER_ADDR}"
+    echo ""
+fi
+
+# ---------------------------------------------------------------------------
+# Stop existing instances
+# ---------------------------------------------------------------------------
+echo "=== Stopping existing instances ==="
+# Use separate oc exec per kill so that OOM-killing one shell doesn't abort the rest.
+oc exec "${PREFILLER_POD}" -- pkill -9 -f "vllm serve.*${PREFILLER_HTTP_PORT}" 2>/dev/null || true
+oc exec "${PREFILLER_POD}" -- pkill -9 -f "vllm serve.*${DECODER_HTTP_PORT}"   2>/dev/null || true
+oc exec "${PREFILLER_POD}" -- pkill -9 -f "pd_connector_proxy.py"              2>/dev/null || true
+oc exec "${PREFILLER_POD}" -- pkill -9 -f "toy_proxy_server.py"                2>/dev/null || true
+oc exec "${PREFILLER_POD}" -- pkill -9 -f "VLLM::EngineCore"                   2>/dev/null || true
+
+# Wait for proxy port and GPU memory to be released
+oc exec "${PREFILLER_POD}" -- bash -c "
+    echo -n 'Waiting for port ${PROXY_PORT} to be free ...'
+    deadline=\$(( \$(date +%s) + 30 ))
+    while ss -tlnp 2>/dev/null | grep -q ':${PROXY_PORT}[[:space:]]'; do
+        if [[ \$(date +%s) -ge \$deadline ]]; then
+            echo ' timeout (port still in use)' >&2
+            exit 1
+        fi
+        sleep 1
+        echo -n '.'
+    done
+    echo ' free'
+    echo -n 'Waiting for GPU memory to be released ...'
+    deadline=\$(( \$(date +%s) + 60 ))
+    while nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null | grep -q '[0-9]'; do
+        if [[ \$(date +%s) -ge \$deadline ]]; then
+            echo ' timeout (proceeding anyway)'
+            break
+        fi
+        sleep 2
+        echo -n '.'
+    done
+    echo ' done'
+"
+
+# ---------------------------------------------------------------------------
+# Copy scripts to pod(s)
+# ---------------------------------------------------------------------------
+echo "=== Copying scripts ==="
+oc cp "${SCRIPT_DIR}/pd_connector_proxy.py" \
+    "${PROXY_POD}:/tmp/pd_connector_proxy.py"
+oc cp "${REPO_ROOT}/tests/v1/kv_connector/nixl_integration/toy_proxy_server.py" \
+    "${PROXY_POD}:/tmp/toy_proxy_server.py"
+
+# ---------------------------------------------------------------------------
+# Build KV transfer configs
+# ---------------------------------------------------------------------------
+if [[ "${CONNECTOR}" == "pd_connector" ]]; then
+    PREFILLER_KV_CONFIG="{\"kv_connector\":\"OffloadingConnector\",\"kv_role\":\"kv_both\",\"kv_connector_extra_config\":{\"spec_name\":\"TieringOffloadingSpec\",\"cpu_bytes_to_use\":${CPU_BYTES},\"secondary_tiers\":[{\"type\":\"pd_connector\",\"host\":\"${PREFILLER_ADDR}\",\"port\":${PREFILLER_PD_PORT}}]}}"
+    DECODER_KV_CONFIG="{\"kv_connector\":\"OffloadingConnector\",\"kv_role\":\"kv_both\",\"kv_connector_extra_config\":{\"spec_name\":\"TieringOffloadingSpec\",\"cpu_bytes_to_use\":${CPU_BYTES},\"secondary_tiers\":[{\"type\":\"pd_connector\",\"host\":\"${DECODER_ADDR}\",\"port\":${DECODER_PD_PORT}}]}}"
+else
+    PREFILLER_KV_CONFIG="{\"kv_connector\":\"NixlConnector\",\"kv_role\":\"kv_both\"}"
+    DECODER_KV_CONFIG="{\"kv_connector\":\"NixlConnector\",\"kv_role\":\"kv_both\"}"
+fi
+
+# ---------------------------------------------------------------------------
+# Start Prefiller
+# ---------------------------------------------------------------------------
+# Write launcher scripts to pod — env vars baked in at write time so nohup
+# inherits them correctly regardless of the container's default env.
+echo "=== Writing launcher scripts ==="
+oc exec "${PREFILLER_POD}" -- bash -c "cat > /tmp/start_prefiller.sh << 'LAUNCHER'
+#!/usr/bin/env bash
+export VLLM_LOGGING_LEVEL=${LOG_LEVEL}
+export CUDA_VISIBLE_DEVICES=${PREFILLER_GPUS}
+export PYTHONHASHSEED=42
+export VLLM_NIXL_SIDE_CHANNEL_PORT=${NIXL_SIDE_CHANNEL_PORT_PREFILLER}
+export UCX_NET_DEVICES=all
+cd /tmp
+exec ${VLLM_BIN} serve '${MODEL}' \
+    --port ${PREFILLER_HTTP_PORT} \
+    --enforce-eager \
+    --block-size ${BLOCK_SIZE} \
+    --gpu-memory-utilization ${GPU_MEM_UTIL} \
+    --max-model-len ${MAX_MODEL_LEN} \
+    --kv-transfer-config '${PREFILLER_KV_CONFIG}'
+LAUNCHER
+chmod +x /tmp/start_prefiller.sh"
+
+oc exec "${DECODER_POD}" -- bash -c "cat > /tmp/start_decoder.sh << 'LAUNCHER'
+#!/usr/bin/env bash
+export VLLM_LOGGING_LEVEL=${LOG_LEVEL}
+export CUDA_VISIBLE_DEVICES=${DECODER_GPUS}
+export PYTHONHASHSEED=42
+export VLLM_NIXL_SIDE_CHANNEL_PORT=${NIXL_SIDE_CHANNEL_PORT_DECODER}
+export UCX_NET_DEVICES=all
+cd /tmp
+exec ${VLLM_BIN} serve '${MODEL}' \
+    --port ${DECODER_HTTP_PORT} \
+    --enforce-eager \
+    --block-size ${BLOCK_SIZE} \
+    --gpu-memory-utilization ${GPU_MEM_UTIL} \
+    --max-model-len ${MAX_MODEL_LEN} \
+    --kv-transfer-config '${DECODER_KV_CONFIG}'
+LAUNCHER
+chmod +x /tmp/start_decoder.sh"
+
+echo "=== Starting Prefiller ==="
+PREFILLER_PID=$(oc exec "${PREFILLER_POD}" -- bash -c "
+    nohup /tmp/start_prefiller.sh > ${PREFILLER_LOG} 2>&1 &
+    echo \$!
+" 2>/dev/null | tail -1)
+echo "  PID ${PREFILLER_PID} → ${PREFILLER_LOG}"
+
+# ---------------------------------------------------------------------------
+# Start Decoder
+# ---------------------------------------------------------------------------
+echo "=== Starting Decoder ==="
+DECODER_PID=$(oc exec "${DECODER_POD}" -- bash -c "
+    nohup /tmp/start_decoder.sh > ${DECODER_LOG} 2>&1 &
+    echo \$!
+" 2>/dev/null | tail -1)
+echo "  PID ${DECODER_PID} → ${DECODER_LOG}"
+
+# ---------------------------------------------------------------------------
+# Wait for health
+# ---------------------------------------------------------------------------
+wait_for_health() {
+    local pod="$1" name="$2" addr="$3" port="$4" path="${5:-/health}"
+    local deadline=$(( $(date +%s) + HEALTH_TIMEOUT ))
+    echo -n "Waiting for ${name} (${addr}:${port}) ..."
+    while true; do
+        if oc exec "${pod}" -- curl -sf "http://${addr}:${port}${path}" > /dev/null 2>&1; then
+            echo " ready"
+            return 0
+        fi
+        if [[ "$(date +%s)" -ge "${deadline}" ]]; then
+            echo ""
+            echo "ERROR: ${name} did not become healthy within ${HEALTH_TIMEOUT}s" >&2
+            echo "--- last 20 lines of log ---" >&2
+            oc exec "${pod}" -- tail -20 "${PREFILLER_LOG}" 2>/dev/null >&2 || true
+            return 1
+        fi
+        sleep 5
+        echo -n "."
+    done
+}
+
+wait_for_health "${PREFILLER_POD}" "Prefiller" "${PREFILLER_ADDR}" "${PREFILLER_HTTP_PORT}" || exit 1
+wait_for_health "${DECODER_POD}"   "Decoder"   "${DECODER_ADDR}"   "${DECODER_HTTP_PORT}"   || exit 1
+
+# ---------------------------------------------------------------------------
+# Start Proxy
+# ---------------------------------------------------------------------------
+echo "=== Starting Proxy ==="
+if [[ "${CONNECTOR}" == "pd_connector" ]]; then
+    _DECODER_FIRST_FLAG=""
+    [[ "${DECODER_FIRST}" == "true" ]] && _DECODER_FIRST_FLAG="--decoder-first"
+    PROXY_PID=$(oc exec "${PROXY_POD}" -- bash -c "
+        nohup ${PYTHON_BIN} /tmp/pd_connector_proxy.py \
+            --port ${PROXY_PORT} \
+            --host 127.0.0.1 \
+            --prefiller-hosts ${PREFILLER_ADDR} \
+            --prefiller-ports ${PREFILLER_HTTP_PORT} \
+            --decoder-hosts ${DECODER_ADDR} \
+            --decoder-ports ${DECODER_HTTP_PORT} \
+            --pd-connector-host ${PREFILLER_ADDR} \
+            --pd-connector-port ${PREFILLER_PD_PORT} \
+            ${_DECODER_FIRST_FLAG} \
+            > ${PROXY_LOG} 2>&1 &
+        echo \$!
+    " 2>/dev/null | tail -1)
+else
+    PROXY_PID=$(oc exec "${PROXY_POD}" -- bash -c "
+        nohup ${PYTHON_BIN} /tmp/toy_proxy_server.py \
+            --port ${PROXY_PORT} \
+            --host 127.0.0.1 \
+            --prefiller-hosts ${PREFILLER_ADDR} \
+            --prefiller-ports ${PREFILLER_HTTP_PORT} \
+            --decoder-hosts ${DECODER_ADDR} \
+            --decoder-ports ${DECODER_HTTP_PORT} \
+            > ${PROXY_LOG} 2>&1 &
+        echo \$!
+    " 2>/dev/null | tail -1)
+fi
+echo "  PID ${PROXY_PID} → ${PROXY_LOG}"
+
+wait_for_health "${PROXY_POD}" "Proxy" "127.0.0.1" "${PROXY_PORT}" "/healthcheck" || exit 1
+
+# ---------------------------------------------------------------------------
+# Write state file (consumed by bench_sweep.sh)
+# ---------------------------------------------------------------------------
+cat > "${STATE_FILE}" <<STATE
+# Generated by deploy.sh — $(date)
+CONNECTOR=${CONNECTOR}
+PREFILLER_POD=${PREFILLER_POD}
+DECODER_POD=${DECODER_POD}
+PROXY_POD=${PROXY_POD}
+PREFILLER_ADDR=${PREFILLER_ADDR}
+DECODER_ADDR=${DECODER_ADDR}
+PREFILLER_HTTP_PORT=${PREFILLER_HTTP_PORT}
+DECODER_HTTP_PORT=${DECODER_HTTP_PORT}
+PROXY_PORT=${PROXY_PORT}
+PREFILLER_PID=${PREFILLER_PID}
+DECODER_PID=${DECODER_PID}
+PROXY_PID=${PROXY_PID}
+MODEL=${MODEL}
+PROXY_URL=http://127.0.0.1:${PROXY_PORT}
+STATE
+
+cat <<SUMMARY
+
+=== Deploy complete: ${CONNECTOR} ===
+  Model:    ${MODEL}  gpu_mem=${GPU_MEM_UTIL}  max_len=${MAX_MODEL_LEN}
+  Proxy:    http://127.0.0.1:${PROXY_PORT}/v1/completions
+  State:    ${STATE_FILE}
+
+  To stop:
+    oc exec ${PREFILLER_POD} -- kill ${PREFILLER_PID} ${DECODER_PID} ${PROXY_PID}
+
+  Example request:
+    oc exec ${PROXY_POD} -- curl http://127.0.0.1:${PROXY_PORT}/v1/completions \\
+      -H 'Content-Type: application/json' \\
+      -d '{"model":"${MODEL}","prompt":"Hello","max_tokens":20}'
+
+SUMMARY
