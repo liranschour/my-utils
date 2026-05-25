@@ -52,7 +52,7 @@ done < "$CONFIG_FILE"
 CONNECTOR="${CONNECTOR:-pd_connector}"
 PREFILLER_POD="${PREFILLER_POD:-llmd-transport-decoder}"
 DECODER_POD="${DECODER_POD:-llmd-transport-decoder}"
-PROXY_POD="${PROXY_POD:-${DECODER_POD}}"
+PROXY_POD="${PROXY_POD:-${PREFILLER_POD}}"
 PREFILLER_GPUS="${PREFILLER_GPUS:-0}"
 DECODER_GPUS="${DECODER_GPUS:-1}"
 
@@ -121,17 +121,45 @@ fi
 # ---------------------------------------------------------------------------
 # Stop existing instances
 # ---------------------------------------------------------------------------
-echo "=== Stopping existing instances ==="
-# Use separate oc exec per kill so that OOM-killing one shell doesn't abort the rest.
-oc exec "${PREFILLER_POD}" -- pkill -9 -f "vllm serve.*${PREFILLER_HTTP_PORT}" 2>/dev/null || true
-oc exec "${PREFILLER_POD}" -- pkill -9 -f "vllm serve.*${DECODER_HTTP_PORT}"   2>/dev/null || true
-oc exec "${PREFILLER_POD}" -- pkill -9 -f "pd_connector_proxy.py"              2>/dev/null || true
-oc exec "${PREFILLER_POD}" -- pkill -9 -f "toy_proxy_server.py"                2>/dev/null || true
-oc exec "${PREFILLER_POD}" -- pkill -9 -f "VLLM::EngineCore"                   2>/dev/null || true
+# Kill stale processes, free /dev/shm, wait for GPU memory release on a pod.
+# In multi-pod mode this runs on each pod; in single-pod mode just once.
+cleanup_pod() {
+    local pod="$1" http_port="$2" role="$3"
+    echo "--- cleanup ${role} pod=${pod} ---"
+    # Use separate oc exec per kill so OOM-killing one shell doesn't abort the rest.
+    oc exec "${pod}" -- pkill -9 -f "vllm serve.*${http_port}" 2>/dev/null || true
+    oc exec "${pod}" -- pkill -9 -f "VLLM::EngineCore"         2>/dev/null || true
 
-# Wait for proxy port and GPU memory to be released
-oc exec "${PREFILLER_POD}" -- bash -c "
-    echo -n 'Waiting for port ${PROXY_PORT} to be free ...'
+    oc exec "${pod}" -- bash -c "
+        shm_before=\$(du -s /dev/shm 2>/dev/null | awk '{print \$1}')
+        rm -f /dev/shm/vllm_offload_*.mmap /dev/shm/sem.mp-* 2>/dev/null
+        shm_after=\$(du -s /dev/shm 2>/dev/null | awk '{print \$1}')
+        freed=\$(( (shm_before - shm_after) / 1048576 ))
+        [[ \$freed -gt 0 ]] && echo \"Freed \${freed}GB from /dev/shm\" || echo '/dev/shm clean'
+    " 2>/dev/null || true
+
+    oc exec "${pod}" -- bash -c "
+        echo -n 'Waiting for GPU memory to be released ...'
+        deadline=\$(( \$(date +%s) + 60 ))
+        while nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null | grep -q '[0-9]'; do
+            if [[ \$(date +%s) -ge \$deadline ]]; then
+                echo ' timeout (proceeding anyway)'
+                break
+            fi
+            sleep 2
+            echo -n '.'
+        done
+        echo ' done'
+    "
+}
+
+echo "=== Stopping existing instances ==="
+
+# Proxy lives on PROXY_POD — kill it and wait for its port to free.
+oc exec "${PROXY_POD}" -- pkill -9 -f "pd_connector_proxy.py" 2>/dev/null || true
+oc exec "${PROXY_POD}" -- pkill -9 -f "toy_proxy_server.py"   2>/dev/null || true
+oc exec "${PROXY_POD}" -- bash -c "
+    echo -n 'Waiting for proxy port ${PROXY_PORT} to be free ...'
     deadline=\$(( \$(date +%s) + 30 ))
     while ss -tlnp 2>/dev/null | grep -q ':${PROXY_PORT}[[:space:]]'; do
         if [[ \$(date +%s) -ge \$deadline ]]; then
@@ -142,18 +170,12 @@ oc exec "${PREFILLER_POD}" -- bash -c "
         echo -n '.'
     done
     echo ' free'
-    echo -n 'Waiting for GPU memory to be released ...'
-    deadline=\$(( \$(date +%s) + 60 ))
-    while nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null | grep -q '[0-9]'; do
-        if [[ \$(date +%s) -ge \$deadline ]]; then
-            echo ' timeout (proceeding anyway)'
-            break
-        fi
-        sleep 2
-        echo -n '.'
-    done
-    echo ' done'
 "
+
+cleanup_pod "${PREFILLER_POD}" "${PREFILLER_HTTP_PORT}" "prefiller"
+if ! $SINGLE_POD; then
+    cleanup_pod "${DECODER_POD}" "${DECODER_HTTP_PORT}" "decoder"
+fi
 
 # ---------------------------------------------------------------------------
 # Copy scripts to pod(s)
@@ -186,6 +208,7 @@ oc exec "${PREFILLER_POD}" -- bash -c "cat > /tmp/start_prefiller.sh << 'LAUNCHE
 export VLLM_LOGGING_LEVEL=${LOG_LEVEL}
 export CUDA_VISIBLE_DEVICES=${PREFILLER_GPUS}
 export PYTHONHASHSEED=42
+export VLLM_NIXL_SIDE_CHANNEL_HOST=${PREFILLER_ADDR}
 export VLLM_NIXL_SIDE_CHANNEL_PORT=${NIXL_SIDE_CHANNEL_PORT_PREFILLER}
 export UCX_NET_DEVICES=all
 cd /tmp
@@ -204,6 +227,7 @@ oc exec "${DECODER_POD}" -- bash -c "cat > /tmp/start_decoder.sh << 'LAUNCHER'
 export VLLM_LOGGING_LEVEL=${LOG_LEVEL}
 export CUDA_VISIBLE_DEVICES=${DECODER_GPUS}
 export PYTHONHASHSEED=42
+export VLLM_NIXL_SIDE_CHANNEL_HOST=${DECODER_ADDR}
 export VLLM_NIXL_SIDE_CHANNEL_PORT=${NIXL_SIDE_CHANNEL_PORT_DECODER}
 export UCX_NET_DEVICES=all
 cd /tmp
@@ -238,7 +262,7 @@ echo "  PID ${DECODER_PID} → ${DECODER_LOG}"
 # Wait for health
 # ---------------------------------------------------------------------------
 wait_for_health() {
-    local pod="$1" name="$2" addr="$3" port="$4" path="${5:-/health}"
+    local pod="$1" name="$2" addr="$3" port="$4" log="$5" path="${6:-/health}"
     local deadline=$(( $(date +%s) + HEALTH_TIMEOUT ))
     echo -n "Waiting for ${name} (${addr}:${port}) ..."
     while true; do
@@ -249,8 +273,8 @@ wait_for_health() {
         if [[ "$(date +%s)" -ge "${deadline}" ]]; then
             echo ""
             echo "ERROR: ${name} did not become healthy within ${HEALTH_TIMEOUT}s" >&2
-            echo "--- last 20 lines of log ---" >&2
-            oc exec "${pod}" -- tail -20 "${PREFILLER_LOG}" 2>/dev/null >&2 || true
+            echo "--- last 20 lines of ${log} ---" >&2
+            oc exec "${pod}" -- tail -20 "${log}" 2>/dev/null >&2 || true
             return 1
         fi
         sleep 5
@@ -258,8 +282,24 @@ wait_for_health() {
     done
 }
 
-wait_for_health "${PREFILLER_POD}" "Prefiller" "${PREFILLER_ADDR}" "${PREFILLER_HTTP_PORT}" || exit 1
-wait_for_health "${DECODER_POD}"   "Decoder"   "${DECODER_ADDR}"   "${DECODER_HTTP_PORT}"   || exit 1
+wait_for_health "${PREFILLER_POD}" "Prefiller" "${PREFILLER_ADDR}" "${PREFILLER_HTTP_PORT}" "${PREFILLER_LOG}" || exit 1
+
+# Multi-pod connectivity preflight: now that the prefiller HTTP port is
+# listening, confirm the decoder pod can actually reach it. If this fails
+# the KV transport will fail too — surface the routing/NetworkPolicy issue
+# now rather than after a long decoder timeout.
+if ! $SINGLE_POD; then
+    echo -n "Preflight: ${DECODER_POD} -> ${PREFILLER_ADDR}:${PREFILLER_HTTP_PORT} ... "
+    if oc exec "${DECODER_POD}" -- curl -sf --max-time 5 "http://${PREFILLER_ADDR}:${PREFILLER_HTTP_PORT}/health" > /dev/null 2>&1; then
+        echo "ok"
+    else
+        echo "FAILED" >&2
+        echo "ERROR: decoder pod cannot reach prefiller HTTP port. Check NetworkPolicy / routing." >&2
+        exit 1
+    fi
+fi
+
+wait_for_health "${DECODER_POD}"   "Decoder"   "${DECODER_ADDR}"   "${DECODER_HTTP_PORT}"   "${DECODER_LOG}"   || exit 1
 
 # ---------------------------------------------------------------------------
 # Start Proxy
@@ -297,7 +337,7 @@ else
 fi
 echo "  PID ${PROXY_PID} → ${PROXY_LOG}"
 
-wait_for_health "${PROXY_POD}" "Proxy" "127.0.0.1" "${PROXY_PORT}" "/healthcheck" || exit 1
+wait_for_health "${PROXY_POD}" "Proxy" "127.0.0.1" "${PROXY_PORT}" "${PROXY_LOG}" "/healthcheck" || exit 1
 
 # ---------------------------------------------------------------------------
 # Write state file (consumed by bench_sweep.sh)
