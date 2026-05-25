@@ -50,7 +50,21 @@ Install uv, clone the vLLM fork, install from source in editable mode, and verif
    oc exec <pod_name> -- bash -c "uv pip install nvidia-cuda-runtime-cu12 --system"
    ```
 
-7. **Sanity test** — verify vllm imports, CLI works, and GPUs are visible:
+7. **Fix flashinfer version mismatch**: The cu130 precompiled wheel variant pulls in `flashinfer-jit-cache` at a newer version that conflicts with the `flashinfer-python` already installed in the image. Remove it and reinstall the correct versions from requirements:
+   ```
+   oc exec <pod_name> -- bash -c "pip uninstall -y flashinfer-jit-cache 2>/dev/null; cd /vllm-workspace/vllm && uv pip install flashinfer-python==0.6.8.post1 flashinfer-cubin==0.6.8.post1 --system --reinstall"
+   ```
+   Verify the fix:
+   ```
+   oc exec <pod_name> -- python3 -c "import flashinfer; print('flashinfer OK')"
+   ```
+
+8. **Re-pin torch to 2.11.0+cu130**: The flashinfer reinstall in step 7 resolves to `torch==2.12.0`, which has an ABI mismatch with the cu130 precompiled `vllm/_C.abi3.so` (built against torch 2.11.0). Without this step, `vllm --version` fails with `ImportError: undefined symbol` on `torch::Library::_def`. Force-pin torch back:
+   ```
+   oc exec <pod_name> -- bash -c "uv pip install 'torch==2.11.0' --system --reinstall --torch-backend=auto"
+   ```
+
+9. **Sanity test** — verify vllm imports, CLI works, and GPUs are visible:
    ```
    oc exec <pod_name> -- python3 -c "
    import vllm
@@ -62,4 +76,4 @@ Install uv, clone the vLLM fork, install from source in editable mode, and verif
    oc exec <pod_name> -- vllm --version
    ```
 
-8. **Report**: Show success or failure. If the install step fails, show the last 30 lines of output for debugging.
+10. **Report**: Show success or failure. If the install step fails, show the last 30 lines of output for debugging.
