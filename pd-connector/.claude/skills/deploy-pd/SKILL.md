@@ -30,6 +30,12 @@ evictions and the offload layer is useless. Single-pod values are smaller
 because two engines share `/dev/shm` on the same pod. NixlConnector ignores
 `CPU_BYTES` (GPU-to-GPU transport).
 
+**TP > 1 note:** `deploy.sh` auto-detects available GPUs and sets
+`--tensor-parallel-size` per engine (single-pod: even split; two-pod: all GPUs
+per pod). Per-engine GPU KV cache scales roughly linearly with TP, so on
+multi-GPU pods consider raising `CPU_BYTES` proportionally — the presets
+above assume TP=1.
+
 ## Connector Differences
 
 | | PDConnector (default) | NixlConnector (`--nixl`) |
@@ -44,8 +50,10 @@ because two engines share `/dev/shm` on the same pod. NixlConnector ignores
 
 1. **Parse arguments**: Extract `pod_name`, `--decoder-pod <name>` (if present), and the flags `--large`, `--nixl`, `--debug` from `$ARGUMENTS`.
 
-   - If `--decoder-pod <name>` is set: **two-pod mode**. Both pods host one engine each; proxy stays on `pod_name` (co-located with the prefiller). Each pod uses its own GPU 0.
-   - Otherwise: **single-pod mode** (current behavior — prefiller on GPU 0, decoder on GPU 1 of `pod_name`).
+   - If `--decoder-pod <name>` is set: **two-pod mode**. Both pods host one engine each; proxy stays on `pod_name` (co-located with the prefiller). Each pod uses **all** of its own GPUs (TP per engine = #GPUs on that pod).
+   - Otherwise: **single-pod mode**. GPUs on `pod_name` are split evenly: prefiller gets the lower half, decoder gets the upper half (TP per engine = #GPUs / 2). For a 2-GPU pod this matches the old GPU 0 / GPU 1 behavior. Errors on odd or single-GPU pods — set `PREFILLER_GPUS` / `DECODER_GPUS` explicitly in those cases.
+
+   GPU assignment is auto-detected by `deploy.sh` when both env vars are unset; prepend `PREFILLER_GPUS=... DECODER_GPUS=...` to force a specific assignment.
 
 2. **Resolve config**: Based on connector, preset, and topology:
 
@@ -63,7 +71,6 @@ because two engines share `/dev/shm` on the same pod. NixlConnector ignores
    - **small**:
      ```
      PREFILLER_POD=<pod_name> DECODER_POD=<decoder_pod> PROXY_POD=<pod_name> \
-     PREFILLER_GPUS=0 DECODER_GPUS=0 \
      MODEL=Qwen/Qwen3-0.6B GPU_MEM_UTIL=0.90 MAX_MODEL_LEN=32768 BLOCK_SIZE=16 \
      CPU_BYTES=103079215104 VLLM_BIN=vllm PYTHON_BIN=python3 \
      bash tests/v1/kv_offload/deploy.sh --config tests/v1/kv_offload/configs/cluster_pd_two_pods.env
@@ -71,7 +78,6 @@ because two engines share `/dev/shm` on the same pod. NixlConnector ignores
    - **large** (`--large --decoder-pod ...`):
      ```
      PREFILLER_POD=<pod_name> DECODER_POD=<decoder_pod> PROXY_POD=<pod_name> \
-     PREFILLER_GPUS=0 DECODER_GPUS=0 \
      MODEL=Qwen/Qwen3-8B GPU_MEM_UTIL=0.90 MAX_MODEL_LEN=40960 BLOCK_SIZE=16 \
      CPU_BYTES=103079215104 VLLM_BIN=vllm PYTHON_BIN=python3 \
      bash tests/v1/kv_offload/deploy.sh --config tests/v1/kv_offload/configs/cluster_pd_two_pods.env
@@ -97,7 +103,6 @@ because two engines share `/dev/shm` on the same pod. NixlConnector ignores
    - **small**:
      ```
      CONNECTOR=nixl PREFILLER_POD=<pod_name> DECODER_POD=<decoder_pod> PROXY_POD=<pod_name> \
-     PREFILLER_GPUS=0 DECODER_GPUS=0 \
      MODEL=Qwen/Qwen3-0.6B GPU_MEM_UTIL=0.90 MAX_MODEL_LEN=32768 BLOCK_SIZE=16 \
      VLLM_BIN=vllm PYTHON_BIN=python3 \
      bash tests/v1/kv_offload/deploy.sh --config tests/v1/kv_offload/configs/cluster_nixl_two_pods.env
@@ -105,7 +110,6 @@ because two engines share `/dev/shm` on the same pod. NixlConnector ignores
    - **large** (`--large --nixl --decoder-pod ...`):
      ```
      CONNECTOR=nixl PREFILLER_POD=<pod_name> DECODER_POD=<decoder_pod> PROXY_POD=<pod_name> \
-     PREFILLER_GPUS=0 DECODER_GPUS=0 \
      MODEL=Qwen/Qwen3-8B GPU_MEM_UTIL=0.90 MAX_MODEL_LEN=40960 BLOCK_SIZE=16 \
      VLLM_BIN=vllm PYTHON_BIN=python3 \
      bash tests/v1/kv_offload/deploy.sh --config tests/v1/kv_offload/configs/cluster_nixl_two_pods.env
