@@ -53,8 +53,11 @@ CONNECTOR="${CONNECTOR:-pd_connector}"
 PREFILLER_POD="${PREFILLER_POD:-llmd-transport-decoder}"
 DECODER_POD="${DECODER_POD:-llmd-transport-decoder}"
 PROXY_POD="${PROXY_POD:-${PREFILLER_POD}}"
-PREFILLER_GPUS="${PREFILLER_GPUS:-0}"
-DECODER_GPUS="${DECODER_GPUS:-1}"
+# GPU assignment: auto-detect when neither is set (use all pod GPUs, even-split
+# in single-pod mode). Explicit values (env or config) take precedence —
+# resolved in the auto-detect block below after topology is known.
+PREFILLER_GPUS_USER_SET=true; [[ -z "${PREFILLER_GPUS+x}" ]] && PREFILLER_GPUS_USER_SET=false
+DECODER_GPUS_USER_SET=true;   [[ -z "${DECODER_GPUS+x}"   ]] && DECODER_GPUS_USER_SET=false
 
 MODEL="${MODEL:-Qwen/Qwen3-8B}"
 GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.90}"
@@ -91,9 +94,56 @@ else
     SINGLE_POD=false
 fi
 
+# ---------------------------------------------------------------------------
+# Auto-detect GPUs (if not user-set) and derive tensor-parallel size
+# ---------------------------------------------------------------------------
+get_pod_gpu_count() {
+    oc exec "$1" -- nvidia-smi --query-gpu=index --format=csv,noheader 2>/dev/null \
+        | grep -c '^[0-9]'
+}
+
+if ! $PREFILLER_GPUS_USER_SET && ! $DECODER_GPUS_USER_SET; then
+    if $SINGLE_POD; then
+        n=$(get_pod_gpu_count "$PREFILLER_POD")
+        if (( n < 1 )); then
+            echo "ERROR: no GPUs found on pod ${PREFILLER_POD}" >&2
+            exit 1
+        elif (( n == 1 )); then
+            echo "ERROR: single-pod auto-GPU needs >=2 GPUs (found 1 on ${PREFILLER_POD})." >&2
+            echo "       Set PREFILLER_GPUS=0 DECODER_GPUS=0 explicitly to share one GPU." >&2
+            exit 1
+        elif (( n % 2 != 0 )); then
+            echo "ERROR: single-pod auto-split needs even GPU count (found ${n} on ${PREFILLER_POD})." >&2
+            echo "       Set PREFILLER_GPUS / DECODER_GPUS explicitly." >&2
+            exit 1
+        else
+            half=$(( n / 2 ))
+            PREFILLER_GPUS=$(seq -s, 0 $((half - 1)))
+            DECODER_GPUS=$(seq -s, "$half" $((n - 1)))
+        fi
+    else
+        np=$(get_pod_gpu_count "$PREFILLER_POD")
+        nd=$(get_pod_gpu_count "$DECODER_POD")
+        if (( np < 1 || nd < 1 )); then
+            echo "ERROR: GPU detect failed (prefiller=${np} decoder=${nd})" >&2
+            exit 1
+        fi
+        PREFILLER_GPUS=$(seq -s, 0 $((np - 1)))
+        DECODER_GPUS=$(seq -s, 0 $((nd - 1)))
+    fi
+elif [[ "$PREFILLER_GPUS_USER_SET" != "$DECODER_GPUS_USER_SET" ]]; then
+    echo "ERROR: must set both PREFILLER_GPUS and DECODER_GPUS, or neither." >&2
+    exit 1
+fi
+
+# Tensor-parallel size = #GPUs in the assignment, overridable via env.
+gpu_count_in() { awk -F, '{print NF}' <<< "$1"; }
+PREFILLER_TP="${PREFILLER_TP:-$(gpu_count_in "$PREFILLER_GPUS")}"
+DECODER_TP="${DECODER_TP:-$(gpu_count_in "$DECODER_GPUS")}"
+
 echo "=== Deploy: ${CONNECTOR} ==="
-echo "  Prefiller: pod=${PREFILLER_POD} gpus=${PREFILLER_GPUS} http=:${PREFILLER_HTTP_PORT}"
-echo "  Decoder:   pod=${DECODER_POD} gpus=${DECODER_GPUS} http=:${DECODER_HTTP_PORT}"
+echo "  Prefiller: pod=${PREFILLER_POD} gpus=[${PREFILLER_GPUS}] tp=${PREFILLER_TP} http=:${PREFILLER_HTTP_PORT}"
+echo "  Decoder:   pod=${DECODER_POD} gpus=[${DECODER_GPUS}] tp=${DECODER_TP} http=:${DECODER_HTTP_PORT}"
 echo "  Proxy:     pod=${PROXY_POD} http=:${PROXY_PORT}"
 echo "  Model:     ${MODEL}  gpu_mem=${GPU_MEM_UTIL}  max_len=${MAX_MODEL_LEN}"
 echo "  Single-pod: ${SINGLE_POD}"
@@ -214,6 +264,7 @@ export UCX_NET_DEVICES=all
 cd /tmp
 exec ${VLLM_BIN} serve '${MODEL}' \
     --port ${PREFILLER_HTTP_PORT} \
+    --tensor-parallel-size ${PREFILLER_TP} \
     --enforce-eager \
     --block-size ${BLOCK_SIZE} \
     --gpu-memory-utilization ${GPU_MEM_UTIL} \
@@ -233,6 +284,7 @@ export UCX_NET_DEVICES=all
 cd /tmp
 exec ${VLLM_BIN} serve '${MODEL}' \
     --port ${DECODER_HTTP_PORT} \
+    --tensor-parallel-size ${DECODER_TP} \
     --enforce-eager \
     --block-size ${BLOCK_SIZE} \
     --gpu-memory-utilization ${GPU_MEM_UTIL} \
