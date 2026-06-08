@@ -165,6 +165,7 @@ deploy_connector() {
         CPU_BYTES="${CPU_BYTES}" \
         VLLM_BIN="${VLLM_BIN}" \
         PYTHON_BIN="${PYTHON_BIN}" \
+        EXTRA_VLLM_ARGS="${EXTRA_VLLM_ARGS:-}" \
         bash "${SCRIPT_DIR}/deploy.sh" --config "${config_file}"
 }
 
