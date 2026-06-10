@@ -57,6 +57,8 @@ sequenceDiagram
 
     Prod_P2P--)Cons_P2P: 𝗖𝗧𝗥𝗟: lookup_resp(kv_request_id, hit_indexes)
 
+    Cons_P2P->>Prod_P2P: 𝗖𝗧𝗥𝗟: fetch(kv_request_id, block_hashes, src_block_ids)
+
     Prod_P2P-)Cons_P2P: 𝗗𝗔𝗧𝗔: NIXL.Transfer(WRITE, src_descs, dst_descs) <br/> for the subset of hashes that hit
     Prod_P2P-->>Cons_P2P: TransferDone(kv_request_id, served_indexes)
 
@@ -83,7 +85,7 @@ Set on every request whose KV blocks should be pulled from a remote peer.
 ## Minimal Example
 
 ```python
-# Consumer request — pull KV for this prompt from a peer that has it cached.
+# Consumer request — pull KV for this prompt from a peer
 kv_transfer_params = {
     "kv_request_id": "<unique-transfer-id>",
     "do_p2p_fetch": True,
@@ -91,8 +93,4 @@ kv_transfer_params = {
     "remote_port": <producer-port>,
 }
 
-# Producer request — no kv_transfer_params needed.
-# The peer simply needs offloading enabled and the relevant blocks already
-# resident in its CPU cache (e.g., from a previous request the orchestrator
-# routed there).
 ```
