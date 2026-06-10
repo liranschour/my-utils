@@ -12,6 +12,34 @@ A single peer can act as consumer for some requests and producer for others at t
 The orchestration layer indicates P2P **on the consumer side only**, on the request itself. The producer is **implicit**: it has no per-request flag; it serves whatever block hashes it currently holds in CPU cache.
 
 
+## Orchestration-Level Protocol
+
+`kv_transfer_params` is set on the consumer's request only. The producer requires no orchestration signal beyond having offloading enabled and having previously processed work that left the relevant blocks in its CPU KV cache.
+
+### Consumer
+
+Set on every request whose KV blocks should be pulled from a remote peer.
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `kv_request_id` | `str` | Yes | Unique ID for this transfer transaction (allocated by the orchestrator) |
+| `do_p2p_fetch` | `bool` | Yes | Indicates that KV blocks should be pulled from a remote peer |
+| `remote_host` | `str` | Yes | IP address / hostname of the producer peer |
+| `remote_port` | `int` or `str` | Yes | Listening port of the producer peer |
+
+
+## Minimal Example
+
+```python
+# Consumer request — pull KV for this prompt from a peer
+kv_transfer_params = {
+    "kv_request_id": "<unique-transfer-id>",
+    "do_p2p_fetch": True,
+    "remote_host": "<producer-ip>",
+    "remote_port": <producer-port>,
+}
+```
+
 ## Component Diagram
 
 ```mermaid
@@ -65,32 +93,5 @@ sequenceDiagram
     Cons_TM->>Cons_P2P: get_finished()
     Note right of Cons_P2P: Hits → loaded into GPU as a normal cache hit<br/>Misses → recomputed by the engine
 ```
-
-## Orchestration-Level Protocol
-
-`kv_transfer_params` is set on the consumer's request only. The producer requires no orchestration signal beyond having offloading enabled and having previously processed work that left the relevant blocks in its CPU KV cache.
-
-### Consumer
-
-Set on every request whose KV blocks should be pulled from a remote peer.
-
-| Field | Type | Required | Description |
-|---|---|---|---|
-| `kv_request_id` | `str` | Yes | Unique ID for this transfer transaction (allocated by the orchestrator) |
-| `do_p2p_fetch` | `bool` | Yes | Indicates that KV blocks should be pulled from a remote peer |
-| `remote_host` | `str` | Yes | IP address / hostname of the producer peer |
-| `remote_port` | `int` or `str` | Yes | Listening port of the producer peer |
-
-
-## Minimal Example
-
-```python
-# Consumer request — pull KV for this prompt from a peer
-kv_transfer_params = {
-    "kv_request_id": "<unique-transfer-id>",
-    "do_p2p_fetch": True,
-    "remote_host": "<producer-ip>",
-    "remote_port": <producer-port>,
-}
 
 ```
