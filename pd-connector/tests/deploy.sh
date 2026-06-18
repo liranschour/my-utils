@@ -59,7 +59,7 @@ PROXY_POD="${PROXY_POD:-${PREFILLER_POD}}"
 PREFILLER_GPUS_USER_SET=true; [[ -z "${PREFILLER_GPUS+x}" ]] && PREFILLER_GPUS_USER_SET=false
 DECODER_GPUS_USER_SET=true;   [[ -z "${DECODER_GPUS+x}"   ]] && DECODER_GPUS_USER_SET=false
 
-MODEL="${MODEL:-Qwen/Qwen3-8B}"
+MODEL="${MODEL:-meta-llama/Llama-3.1-8B-Instruct}"
 GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.90}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-8192}"
 BLOCK_SIZE="${BLOCK_SIZE:-16}"
@@ -210,7 +210,7 @@ cleanup_pod() {
 echo "=== Stopping existing instances ==="
 
 # Proxy lives on PROXY_POD — kill it and wait for its port to free.
-oc exec "${PROXY_POD}" -- pkill -9 -f "pd_connector_proxy.py" 2>/dev/null || true
+oc exec "${PROXY_POD}" -- pkill -9 -f "p2p_connector_proxy.py" 2>/dev/null || true
 oc exec "${PROXY_POD}" -- pkill -9 -f "toy_proxy_server.py"   2>/dev/null || true
 oc exec "${PROXY_POD}" -- bash -c "
     echo -n 'Waiting for proxy port ${PROXY_PORT} to be free ...'
@@ -235,8 +235,8 @@ fi
 # Copy scripts to pod(s)
 # ---------------------------------------------------------------------------
 echo "=== Copying scripts ==="
-oc cp "${SCRIPT_DIR}/pd_connector_proxy.py" \
-    "${PROXY_POD}:/tmp/pd_connector_proxy.py"
+oc cp "${SCRIPT_DIR}/p2p_connector_proxy.py" \
+    "${PROXY_POD}:/tmp/p2p_connector_proxy.py"
 oc cp "${REPO_ROOT}/tests/v1/kv_connector/nixl_integration/toy_proxy_server.py" \
     "${PROXY_POD}:/tmp/toy_proxy_server.py"
 
@@ -244,8 +244,8 @@ oc cp "${REPO_ROOT}/tests/v1/kv_connector/nixl_integration/toy_proxy_server.py" 
 # Build KV transfer configs
 # ---------------------------------------------------------------------------
 if [[ "${CONNECTOR}" == "pd_connector" ]]; then
-    PREFILLER_KV_CONFIG="{\"kv_connector\":\"OffloadingConnector\",\"kv_role\":\"kv_both\",\"kv_connector_extra_config\":{\"spec_name\":\"TieringOffloadingSpec\",\"cpu_bytes_to_use\":${CPU_BYTES},\"secondary_tiers\":[{\"type\":\"pd_connector\",\"host\":\"${PREFILLER_ADDR}\",\"port\":${PREFILLER_PD_PORT}}]}}"
-    DECODER_KV_CONFIG="{\"kv_connector\":\"OffloadingConnector\",\"kv_role\":\"kv_both\",\"kv_connector_extra_config\":{\"spec_name\":\"TieringOffloadingSpec\",\"cpu_bytes_to_use\":${CPU_BYTES},\"secondary_tiers\":[{\"type\":\"pd_connector\",\"host\":\"${DECODER_ADDR}\",\"port\":${DECODER_PD_PORT}}]}}"
+    PREFILLER_KV_CONFIG="{\"kv_connector\":\"OffloadingConnector\",\"kv_role\":\"kv_both\",\"kv_connector_extra_config\":{\"spec_name\":\"TieringOffloadingSpec\",\"cpu_bytes_to_use\":${CPU_BYTES},\"secondary_tiers\":[{\"type\":\"p2p_connector\",\"host\":\"${PREFILLER_ADDR}\",\"port\":${PREFILLER_PD_PORT}}]}}"
+    DECODER_KV_CONFIG="{\"kv_connector\":\"OffloadingConnector\",\"kv_role\":\"kv_both\",\"kv_connector_extra_config\":{\"spec_name\":\"TieringOffloadingSpec\",\"cpu_bytes_to_use\":${CPU_BYTES},\"secondary_tiers\":[{\"type\":\"p2p_connector\",\"host\":\"${DECODER_ADDR}\",\"port\":${DECODER_PD_PORT}}]}}"
 elif [[ "${CONNECTOR}" == "nixl" ]]; then
     if [[ "${DISABLE_OFFLOADING}" == "true" ]]; then
         PREFILLER_KV_CONFIG="{\"kv_connector\":\"NixlConnector\",\"kv_role\":\"kv_both\"}"
@@ -274,6 +274,7 @@ export PYTHONHASHSEED=42
 export VLLM_NIXL_SIDE_CHANNEL_HOST=${PREFILLER_ADDR}
 export VLLM_NIXL_SIDE_CHANNEL_PORT=${NIXL_SIDE_CHANNEL_PORT_PREFILLER}
 export UCX_NET_DEVICES=all
+${VLLM_USE_V2_MODEL_RUNNER:+export VLLM_USE_V2_MODEL_RUNNER=${VLLM_USE_V2_MODEL_RUNNER}}
 cd /tmp
 exec ${VLLM_BIN} serve '${MODEL}' \
     --port ${PREFILLER_HTTP_PORT} \
@@ -295,6 +296,7 @@ export PYTHONHASHSEED=42
 export VLLM_NIXL_SIDE_CHANNEL_HOST=${DECODER_ADDR}
 export VLLM_NIXL_SIDE_CHANNEL_PORT=${NIXL_SIDE_CHANNEL_PORT_DECODER}
 export UCX_NET_DEVICES=all
+${VLLM_USE_V2_MODEL_RUNNER:+export VLLM_USE_V2_MODEL_RUNNER=${VLLM_USE_V2_MODEL_RUNNER}}
 cd /tmp
 exec ${VLLM_BIN} serve '${MODEL}' \
     --port ${DECODER_HTTP_PORT} \
@@ -376,17 +378,17 @@ if [[ "${CONNECTOR}" == "pd_connector" ]]; then
     _DECODER_FIRST_FLAG=""
     [[ "${DECODER_FIRST}" == "true" ]] && _DECODER_FIRST_FLAG="--decoder-first"
     PROXY_PID=$(oc exec "${PROXY_POD}" -- bash -c "
-        nohup ${PYTHON_BIN} /tmp/pd_connector_proxy.py \
+        nohup ${PYTHON_BIN} /tmp/p2p_connector_proxy.py \
             --port ${PROXY_PORT} \
             --host 127.0.0.1 \
             --prefiller-hosts ${PREFILLER_ADDR} \
             --prefiller-ports ${PREFILLER_HTTP_PORT} \
             --decoder-hosts ${DECODER_ADDR} \
             --decoder-ports ${DECODER_HTTP_PORT} \
-            --pd-connector-host ${PREFILLER_ADDR} \
-            --pd-connector-port ${PREFILLER_PD_PORT} \
-            --decoder-pd-connector-host ${DECODER_ADDR} \
-            --decoder-pd-connector-port ${DECODER_PD_PORT} \
+            --p2p-connector-host ${PREFILLER_ADDR} \
+            --p2p-connector-port ${PREFILLER_PD_PORT} \
+            --decoder-p2p-connector-host ${DECODER_ADDR} \
+            --decoder-p2p-connector-port ${DECODER_PD_PORT} \
             ${_DECODER_FIRST_FLAG} \
             > ${PROXY_LOG} 2>&1 &
         echo \$!
